@@ -12,14 +12,20 @@ import {
 } from '@jest/globals';
 
 
-const mockSend =
+const mockDynamoSend =
+    jest.fn<(command: unknown) => Promise<unknown>>();
+
+const mockSqsSend =
     jest.fn<(command: unknown) => Promise<unknown>>();
 
 
+/*
+ * Mock DynamoDB
+ */
 jest.mock('@aws-sdk/lib-dynamodb', () => ({
     DynamoDBDocumentClient: {
         from: jest.fn(() => ({
-            send: mockSend,
+            send: mockDynamoSend,
         })),
     },
 
@@ -29,21 +35,45 @@ jest.mock('@aws-sdk/lib-dynamodb', () => ({
 }));
 
 
+/*
+ * Mock SQS
+ */
+jest.mock('@aws-sdk/client-sqs', () => ({
+    SQSClient: jest.fn(() => ({
+        send: mockSqsSend,
+    })),
+
+    SendMessageCommand: jest.fn((input) => ({
+        input,
+    })),
+}));
+
+
+/*
+ * Import da Lambda somente depois dos mocks
+ */
 import { lambdaHandler } from '../../app';
 
 
 describe('Create Order Lambda', () => {
 
     beforeEach(() => {
-        mockSend.mockReset();
-        mockSend.mockResolvedValue({});
+
+        mockDynamoSend.mockReset();
+        mockSqsSend.mockReset();
+
+        mockDynamoSend.mockResolvedValue({});
+        mockSqsSend.mockResolvedValue({});
+
     });
 
 
-    it('should create an order successfully', async () => {
+    it('should create an order and send message to SQS successfully', async () => {
 
         const event = {
+
             httpMethod: 'POST',
+
             path: '/orders',
 
             body: JSON.stringify({
@@ -51,6 +81,7 @@ describe('Create Order Lambda', () => {
                 productId: 'ABC',
                 quantity: 2,
             }),
+
         } as APIGatewayProxyEvent;
 
 
@@ -58,7 +89,8 @@ describe('Create Order Lambda', () => {
             await lambdaHandler(event);
 
 
-        expect(result.statusCode).toBe(201);
+        expect(result.statusCode)
+            .toBe(201);
 
 
         const responseBody =
@@ -66,10 +98,15 @@ describe('Create Order Lambda', () => {
 
 
         expect(responseBody).toMatchObject({
+
             customerId: '123',
+
             productId: 'ABC',
+
             quantity: 2,
+
             status: 'RECEIVED',
+
         });
 
 
@@ -81,17 +118,32 @@ describe('Create Order Lambda', () => {
             .toBeDefined();
 
 
-        expect(mockSend)
+        /*
+         * DynamoDB deve ter sido chamado uma vez
+         */
+        expect(mockDynamoSend)
             .toHaveBeenCalledTimes(1);
+
+
+        /*
+         * SQS deve ter sido chamado uma vez
+         */
+        expect(mockSqsSend)
+            .toHaveBeenCalledTimes(1);
+
     });
 
 
     it('should return 400 when body is missing', async () => {
 
         const event = {
+
             httpMethod: 'POST',
+
             path: '/orders',
+
             body: null,
+
         } as APIGatewayProxyEvent;
 
 
@@ -106,25 +158,36 @@ describe('Create Order Lambda', () => {
         expect(
             JSON.parse(result.body)
         ).toEqual({
+
             message: 'Request body is required',
+
         });
 
 
-        expect(mockSend)
+        expect(mockDynamoSend)
             .not
             .toHaveBeenCalled();
+
+
+        expect(mockSqsSend)
+            .not
+            .toHaveBeenCalled();
+
     });
 
 
     it('should return 400 when required fields are missing', async () => {
 
         const event = {
+
             httpMethod: 'POST',
+
             path: '/orders',
 
             body: JSON.stringify({
                 customerId: '123',
             }),
+
         } as APIGatewayProxyEvent;
 
 
@@ -139,26 +202,36 @@ describe('Create Order Lambda', () => {
         expect(
             JSON.parse(result.body)
         ).toEqual({
+
             message:
                 'customerId, productId and quantity are required',
+
         });
 
 
-        expect(mockSend)
+        expect(mockDynamoSend)
             .not
             .toHaveBeenCalled();
+
+
+        expect(mockSqsSend)
+            .not
+            .toHaveBeenCalled();
+
     });
 
 
     it('should return 500 when DynamoDB fails', async () => {
 
-        mockSend.mockRejectedValue(
+        mockDynamoSend.mockRejectedValue(
             new Error('DynamoDB error')
         );
 
 
         const event = {
+
             httpMethod: 'POST',
+
             path: '/orders',
 
             body: JSON.stringify({
@@ -166,6 +239,7 @@ describe('Create Order Lambda', () => {
                 productId: 'ABC',
                 quantity: 2,
             }),
+
         } as APIGatewayProxyEvent;
 
 
@@ -180,12 +254,76 @@ describe('Create Order Lambda', () => {
         expect(
             JSON.parse(result.body)
         ).toEqual({
+
             message: 'Internal server error',
+
         });
 
 
-        expect(mockSend)
+        expect(mockDynamoSend)
             .toHaveBeenCalledTimes(1);
+
+
+        /*
+         * Se DynamoDB falhou,
+         * nem devemos chegar ao SQS
+         */
+        expect(mockSqsSend)
+            .not
+            .toHaveBeenCalled();
+
+    });
+
+
+    it('should return 500 when SQS fails', async () => {
+
+        mockSqsSend.mockRejectedValue(
+            new Error('SQS error')
+        );
+
+
+        const event = {
+
+            httpMethod: 'POST',
+
+            path: '/orders',
+
+            body: JSON.stringify({
+                customerId: '123',
+                productId: 'ABC',
+                quantity: 2,
+            }),
+
+        } as APIGatewayProxyEvent;
+
+
+        const result: APIGatewayProxyResult =
+            await lambdaHandler(event);
+
+
+        expect(result.statusCode)
+            .toBe(500);
+
+
+        expect(
+            JSON.parse(result.body)
+        ).toEqual({
+
+            message: 'Internal server error',
+
+        });
+
+
+        /*
+         * DynamoDB executou antes do SQS
+         */
+        expect(mockDynamoSend)
+            .toHaveBeenCalledTimes(1);
+
+
+        expect(mockSqsSend)
+            .toHaveBeenCalledTimes(1);
+
     });
 
 });
