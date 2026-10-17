@@ -1,27 +1,30 @@
 {
-  "name": "hello_world",
+  "name": "aws-serverless-orders",
   "version": "1.0.0",
-  "description": "hello world sample for NodeJS",
+  "description": "AWS Serverless Orders application",
   "main": "app.js",
   "repository": "https://github.com/awslabs/aws-sam-cli/tree/develop/samcli/local/init/templates/cookiecutter-aws-sam-hello-nodejs",
   "author": "SAM CLI",
   "license": "MIT",
   "scripts": {
     "unit": "jest",
-    "lint": "eslint '*.ts' --quiet --fix",
+    "lint": "eslint . --ext .ts --fix",
+    "lint:check": "eslint . --ext .ts",
+    "format": "prettier --write .",
     "compile": "tsc",
     "test": "npm run compile && npm run unit"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1152.0",
+    "@aws-sdk/client-sqs": "^3.1152.0",
     "@aws-sdk/lib-dynamodb": "^3.1152.0",
     "esbuild": "^0.14.14"
   },
   "devDependencies": {
     "@jest/globals": "^29.2.0",
-    "@types/aws-lambda": "^8.10.92",
-    "@types/jest": "^29.2.0",
-    "@types/node": "^20.5.7",
+    "@types/aws-lambda": "^8.10.164",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^20.19.43",
     "@typescript-eslint/eslint-plugin": "^5.10.2",
     "@typescript-eslint/parser": "^5.10.2",
     "eslint": "^8.8.0",

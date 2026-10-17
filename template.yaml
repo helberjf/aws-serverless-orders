@@ -42,6 +42,16 @@ Resources:
 
 
   # ==============================
+  # SQS
+  # ==============================
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+
+    Properties:
+      VisibilityTimeout: 30
+
+  # ==============================
   # Create Order Lambda
   # ==============================
 
@@ -58,10 +68,13 @@ Resources:
       Environment:
         Variables:
           ORDERS_TABLE: !Ref OrdersTable
+          ORDERS_QUEUE_URL: !Ref OrdersQueue
 
       Policies:
         - DynamoDBWritePolicy:
             TableName: !Ref OrdersTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OrdersQueue.QueueName
 
       Events:
 
@@ -111,3 +124,16 @@ Outputs:
     Description: Create Order Lambda ARN
 
     Value: !GetAtt CreateOrderFunction.Arn
+  
+  OrdersQueueUrl:
+
+    Description: SQS Orders Queue URL
+
+    Value: !Ref OrdersQueue
+
+
+  OrdersQueueArn:
+
+    Description: SQS Orders Queue ARN
+
+    Value: !GetAtt OrdersQueue.Arn
