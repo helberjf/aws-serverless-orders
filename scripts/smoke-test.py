@@ -27,30 +27,47 @@ def token_file(path):
 
 def wait_for_message(client, queue, predicate, timeout):
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        result = client.receive_message(
-            QueueUrl=queue,
-            MaxNumberOfMessages=10,
-            WaitTimeSeconds=10,
-            VisibilityTimeout=10,
-        )
-        for message in result.get("Messages", []):
+    receipts = []
+    try:
+        while time.monotonic() < deadline:
+            result = client.receive_message(
+                QueueUrl=queue,
+                MaxNumberOfMessages=10,
+                WaitTimeSeconds=10,
+                VisibilityTimeout=min(43200, timeout + 30),
+            )
+            messages = result.get("Messages", [])
+            receipts.extend(message["ReceiptHandle"] for message in messages)
+            if len(receipts) > 2000:
+                raise RuntimeError(
+                    "Inspection limit reached; use an isolated development audit queue"
+                )
+            for message in messages:
+                try:
+                    body = json.loads(message["Body"])
+                    matched = predicate(body)
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    matched = False
+                if matched:
+                    return body
+        raise TimeoutError("Expected message was not observed before the deadline")
+    finally:
+        # Do not repeatedly receive the same older messages while searching.
+        # Restore every inspected message (including the evidence) on success or failure.
+        errors = []
+        for receipt in receipts:
             try:
-                body = json.loads(message["Body"])
-                matched = predicate(body)
-            except (json.JSONDecodeError, TypeError, AttributeError):
-                matched = False
-            finally:
-                # Leave all messages, including the test evidence, in their queues.
                 client.change_message_visibility(
                     QueueUrl=queue,
-                    ReceiptHandle=message["ReceiptHandle"],
+                    ReceiptHandle=receipt,
                     VisibilityTimeout=0,
                 )
-            if matched:
-                return body
-        time.sleep(2)
-    raise TimeoutError("Expected message was not observed before the deadline")
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise RuntimeError(
+                "Could not restore all inspected messages; visibility will expire automatically"
+            ) from errors[0]
 
 
 def main():
