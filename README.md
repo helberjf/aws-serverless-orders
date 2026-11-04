@@ -4,7 +4,7 @@
 
 The implementation uses AWS Lambda, API Gateway, Cognito, DynamoDB, Streams, SQS, EventBridge and SNS, with AWS SAM for infrastructure. `PROCESSED` means **ready for fulfillment**; payment, inventory reservation and shipping are outside the current business operation.
 
-**Start here:** [Architecture](#architecture) · [Trade-offs](#engineering-decisions-and-trade-offs) · [Run locally](#run-locally) · [API example](#api-example) · [Validation evidence](docs/validation.md)
+**Start here:** [Architecture](#architecture) · [Trade-offs](#engineering-decisions-and-trade-offs) · [Run locally](#run-locally) · [API example](#api-example) · [Validation evidence](docs/validation.md) · [Next improvements](#next-improvements)
 
 ## At a glance
 
@@ -17,7 +17,7 @@ The implementation uses AWS Lambda, API Gateway, Cognito, DynamoDB, Streams, SQS
 | Operations     | Structured logs, metrics, alarms, X-Ray instrumentation, DLQs and recovery runbooks.         |
 | Delivery       | GitHub OIDC, reviewed CloudFormation Change Sets and HTTP canary configuration.              |
 
-**Validation status:** the [2026-11-04 validation record](docs/validation.md) reports **137 passing local tests**, seven built function bundles and a successful containerized health invocation. Live AWS deployment, managed retries/DLQs, Cognito sign-in and canary rollback remain unverified. Hosted GitHub Actions execution was blocked by an account billing restriction. Local checks and deployed behavior are tracked separately.
+**Local validation:** the [2026-11-04 validation record](docs/validation.md) reports **137 passing local tests**, seven built function bundles and a successful containerized health invocation. The record documents the results and execution scope; the [next improvements](#next-improvements) describe the project roadmap.
 
 ## Architecture
 
@@ -144,13 +144,13 @@ Requests require non-empty `customerId`/`productId` strings of up to 128 charact
 - **Consumer retries:** SQS batches return only failed message IDs. Both consumers use a 30-second timeout, a one-second batching window and 181-second visibility timeout. Five unsuccessful receives send a message to a processing DLQ.
 - **Outbox recovery:** pending records do not expire. Published records expire after seven days. Conditional 120-second leases and bounded exponential backoff coordinate the stream publisher and scheduled reconciler.
 - **Delivery semantics:** SQS, EventBridge and SNS are at least once. A successful publish followed by a failed acknowledgment write can publish again. Conditional transactions protect business effects; subscribers must deduplicate stable event IDs when physical notification duplicates matter.
-- **Notification receipts:** permanent receipts protect late replay, at the cost of storage and an unresolved long-term deletion policy.
+- **Notification receipts:** permanent receipts protect late replay and add storage overhead. Business-driven retention policies are part of the [next improvements](#next-improvements).
 
 Use the [operations runbook](docs/operations.md) for alarms, stuck orders, outbox recovery and DLQ redrive. A stream failure record is diagnostic metadata; the durable outbox remains the recovery authority.
 
 ## Testing and evidence
 
-The latest [recorded results](docs/validation.md) separate what was executed from what still needs a deployed environment:
+The latest [recorded results](docs/validation.md) summarize the automated local checks:
 
 | Layer             | Recorded result   | Scope                                                                                                      |
 | ----------------- | ----------------- | ---------------------------------------------------------------------------------------------------------- |
@@ -158,7 +158,8 @@ The latest [recorded results](docs/validation.md) separate what was executed fro
 | Local integration | 7 passing tests   | Real DynamoDB Local transactions and concurrent handlers; SQS/EventBridge/SNS transports use test doubles. |
 | Infrastructure    | 13 passing tests  | Expanded SAM resources, aliases, rollback configuration, scopes, queue settings and role boundaries.       |
 | Tooling           | 16 passing tests  | Change-set identity, parameter preservation, environment checks and plan/apply separation.                 |
-| Live AWS          | Not yet recorded  | Managed delivery, IAM evaluation, Cognito sign-in, observability and canary rollback.                      |
+
+The [development verification guide](docs/deployment.md#authenticate-and-run-live-tests) includes operator-run scripts for the API, Cognito, asynchronous processing, notifications and DLQ exercises. Automating these procedures is part of the project roadmap.
 
 Recorded V8 coverage is **100% lines, 99.21% statements, 100% functions and 93.75% branches**. Coverage is a regression signal, not proof of distributed-system correctness. Test counts and coverage refer to the dated evidence record, not a promise about every later revision.
 
@@ -170,12 +171,15 @@ The [deployment guide](docs/deployment.md) covers OIDC bootstrap, GitHub environ
 
 CloudWatch logs, metrics, 26 configured alarms and a dashboard support operations. Powertools instruments AWS SDK calls for X-Ray; business IDs correlate asynchronous work, without claiming one continuous trace across durable retries. Review [cost assumptions](docs/costs.md) before deploying and the [cleanup runbook](docs/operations.md#cleanup) before deleting resources: retained tables, the user pool and deployment artifacts need separate handling.
 
-## Next validation and scaling steps
+## Next improvements
 
-1. Record a development deployment and live API/event-flow evidence, including negative authorization checks and a controlled DLQ exercise.
-2. Demonstrate a second HTTP deployment, observed canary traffic and alarm-driven rollback.
-3. Measure throughput and recovery time before increasing the reconciler's capacity or sharding its pending-work index.
-4. Define receipt retention, privacy/deletion requirements, SLOs and backup-restore drills before a production commitment.
-5. Introduce payment or inventory orchestration only with explicit business rules, provider idempotency and compensation behavior.
+The next iterations focus on the following product and operational improvements, in priority order:
+
+1. **Automate end-to-end testing in AWS.** Integrate the existing verification scripts into the development delivery workflow and publish correlated evidence of order processing, notifications, and canary/rollback behavior.
+2. **Benchmark performance and costs.** Add controlled load tests to measure API latency, processing throughput, and cost per order, using the results to guide concurrency and batch-size tuning.
+3. **Publish interactive API documentation.** Maintain an OpenAPI specification with Swagger UI and a request collection to simplify authenticated API exploration and demonstrations.
+4. **Expand order queries.** Add authenticated order listing per user, pagination, and status filters while preserving ownership isolation.
+5. **Extend the business workflow.** Add inventory reservation and payment-provider integration, evaluating Step Functions when coordinated steps and compensating actions justify orchestration.
+6. **Improve data recovery and retention.** Exercise backup restoration and define business-driven retention policies that preserve idempotency and protection against late event replay.
 
 Further reading: [architecture decisions](docs/architecture-decisions.md) · [deployment](docs/deployment.md) · [operations](docs/operations.md) · [security](docs/security.md) · [costs](docs/costs.md) · [validation](docs/validation.md) · [portfolio notes](docs/portfolio.md).
