@@ -2,7 +2,7 @@
 
 A serverless backend that accepts authenticated orders, creates durable fulfillment tickets, and distributes business notifications. It demonstrates transactional consistency, at-least-once delivery, idempotency, least-privilege function roles, and controlled releases using AWS SAM.
 
-**Verification status:** 133 local tests pass, including real DynamoDB Local transactions. SAM validates and builds all seven functions. Live AWS deployment, managed retries/DLQs, Cognito sign-in, and canary rollback have **not** been demonstrated in this environment. GitHub Actions execution is subject to the account billing restriction recorded in [validation evidence](docs/validation.md).
+**Verification status:** 137 local tests pass, including real DynamoDB Local transactions. SAM validates and builds all seven functions. Live AWS deployment, managed retries/DLQs, Cognito sign-in, and canary rollback have **not** been demonstrated in this environment. GitHub Actions execution is subject to the account billing restriction recorded in [validation evidence](docs/validation.md).
 
 ## Project overview
 
@@ -214,9 +214,9 @@ DynamoDB Local binds only to `127.0.0.1:18000`. Integration tests create isolate
 | Level                      | What it verifies                                                                                                     | What it does not prove                                                                       |
 | -------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | Unit: 101 tests            | Validation, authorization, races, retries, ambiguous outcomes, partial batches, event publication and telemetry      | AWS service integration                                                                      |
-| Local integration: 6 tests | Real DynamoDB transactions through HTTP/worker handlers; concurrency, rollback, ownership and replay                 | Managed Streams, SQS polling, EventBridge, SNS or Cognito; those transports are test doubles |
-| Infrastructure: 11 tests   | Expanded SAM aliases, canary/rollback configuration, scopes, queue settings, role boundaries, OIDC workflow controls | Actual AWS IAM authorization or runtime rollout                                              |
-| Tooling: 15 tests          | Change-set identity, parameter preservation, plan/apply separation and production protection checks                  | Real GitHub approval or CloudFormation execution                                             |
+| Local integration: 7 tests | Real DynamoDB transactions through HTTP/worker handlers; concurrency, rollback, ownership and replay                 | Managed Streams, SQS polling, EventBridge, SNS or Cognito; those transports are test doubles |
+| Infrastructure: 13 tests   | Expanded SAM aliases, canary/rollback configuration, scopes, queue settings, role boundaries, OIDC workflow controls | Actual AWS IAM authorization or runtime rollout                                              |
+| Tooling: 16 tests          | Change-set identity, parameter preservation, plan/apply separation and production protection checks                  | Real GitHub approval or CloudFormation execution                                             |
 | Live E2E: operator-run     | API, Cognito, SQS/Streams, fulfillment, EventBridge/SNS, optional DLQ                                                | Not executed here; requires approved development deployment                                  |
 
 Measured coverage: **100% lines, 99.21% statements, 100% functions, 93.75% branches**. Thresholds are 90% lines/statements/functions and 85% branches. All critical handlers have 100% measured line coverage. Coverage is a regression signal, not proof of distributed-system correctness. [Evidence and outstanding checks](docs/validation.md) records the actual scope.

@@ -12,9 +12,9 @@ Recorded on **2026-11-04**. Results below were actually executed in the local wo
 | `npm run format:check`                                       | Passed after formatting                                                                      |
 | `npm run test:unit`                                          | **101 tests passed** in eight files                                                          |
 | V8 coverage                                                  | **100% lines, 99.21% statements, 100% functions, 93.75% branches**                           |
-| `npm run test:integration`                                   | **Six tests passed** against real DynamoDB Local                                             |
-| `python -m unittest discover -s tests/infra -v`              | **Eleven tests passed**, including real offline SAM transformation                           |
-| `python -m unittest discover -s tests/tooling -v`            | **Fifteen tests passed**, including plan/apply, production gates and safe queue inspection   |
+| `npm run test:integration`                                   | **Seven tests passed** against real DynamoDB Local                                           |
+| `python -m unittest discover -s tests/infra -v`              | **Thirteen tests passed**, including real offline SAM transformation                         |
+| `python -m unittest discover -s tests/tooling -v`            | **Sixteen tests passed**, including plan/apply, production gates and safe queue inspection   |
 | `npm audit --audit-level=moderate`                           | **Zero known vulnerabilities** across production and development dependencies                |
 | `python scripts/check-secrets.py`                            | Passed the documented credential-pattern check                                               |
 | Python compilation and Black checks                          | Passed for operator tools and infrastructure/tooling tests                                   |
@@ -26,9 +26,22 @@ Recorded on **2026-11-04**. Results below were actually executed in the local wo
 | Actionlint 1.7.12                                            | Both GitHub workflows validated locally                                                      |
 | Mermaid 12.3.0 parser                                        | README architecture diagram parsed successfully as `flowchart-v2`                            |
 
-Total: **133 automated test cases** across unit, local integration, infrastructure and tooling suites. Subtests inside Python cases are not added to that total. These figures are measured evidence, not targets or estimates.
+Total: **137 automated test cases** across unit, local integration, infrastructure and tooling suites. Subtests inside Python cases are not added to that total. These figures are measured evidence, not targets or estimates.
 
 The local SAM invocation emitted a runtime timezone fallback warning and a runtime shutdown message after returning its successful response; the command exited zero. This demonstrates the containerized health handler only, not a deployed API Gateway route.
+
+## PR #4 review corrections
+
+The pre-merge review on 2026-11-04 identified and corrected four issues:
+
+- SNS subscription lifecycle permissions referenced subscription-shaped ARNs; they now authorize the application's parent topics.
+- The reconciler's DynamoDB query permission omitted the required parent table; it now includes that table and only the intended recovery index.
+- A publisher with an older read could bypass another worker's new retry delay; lease acquisition now checks `nextAttemptAt` atomically.
+- A misconfigured deployment could change an existing stack's environment; planning now rejects mismatches before any artifact upload or Change Set creation.
+
+Each new regression test failed against the previous implementation and passed after its fix. The IAM cases verify policy resource coverage offline, not AWS policy evaluation. The retry race runs against DynamoDB Local with a real intervening update. The deployment test covers both development-to-production and production-to-development mismatches without calling AWS. The concurrent creation test also now rejects an incorrect 409 response for identical payloads and permits retrying a transient 500.
+
+The recorded 137-test total includes all four new regression cases. No live AWS execution was added during this review.
 
 ## Tools used
 
