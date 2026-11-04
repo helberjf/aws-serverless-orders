@@ -1,4 +1,5 @@
 import json
+from fnmatch import fnmatchcase
 from pathlib import Path
 import unittest
 import yaml
@@ -80,6 +81,36 @@ class PipelineInfrastructureTests(unittest.TestCase):
             if statement["Resource"] == "*":
                 self.assertIn(statement["Sid"], allowed)
                 self.assertIn("aws:RequestedRegion", json.dumps(statement["Condition"]))
+
+    def test_subscription_lifecycle_authorizes_parent_topics(self):
+        # SNS authorizes subscription operations against the parent topic ARN:
+        # https://docs.aws.amazon.com/service-authorization/latest/reference/list_sns.html
+        statements = self.statements("CloudFormationExecutionRole")
+        values = {
+            "AWS::Partition": "aws",
+            "AWS::Region": "sa-east-1",
+            "AWS::AccountId": "123456789012",
+            "ApplicationStackName": "orders-development",
+        }
+        for action in (
+            "sns:GetSubscriptionAttributes",
+            "sns:SetSubscriptionAttributes",
+            "sns:Unsubscribe",
+        ):
+            patterns = []
+            for statement in statements:
+                if action not in statement["Action"]:
+                    continue
+                resource = statement["Resource"]["Fn::Sub"]
+                for key, value in values.items():
+                    resource = resource.replace("${" + key + "}", value)
+                patterns.append(resource)
+            for topic in ("NotificationsTopic", "AlarmTopic"):
+                with self.subTest(action=action, topic=topic):
+                    arn = f"arn:aws:sns:sa-east-1:123456789012:orders-development-{topic}-generated"
+                    self.assertTrue(any(fnmatchcase(arn, p) for p in patterns))
+            other = "arn:aws:sns:sa-east-1:123456789012:orders-production-NotificationsTopic-generated"
+            self.assertFalse(any(fnmatchcase(other, p) for p in patterns))
 
     def test_deployment_is_manual_and_apply_waits_for_reviewable_plan(self):
         self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch"})

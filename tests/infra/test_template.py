@@ -156,6 +156,25 @@ class InfrastructureTests(unittest.TestCase):
             if resource["Type"] == "AWS::Logs::LogGroup":
                 self.assertEqual(resource["Properties"]["RetentionInDays"], 14)
 
+    def test_recovery_query_authorizes_the_table_and_its_specific_index(self):
+        # DynamoDB Query requires table authorization as well as the selected GSI.
+        statements = self.resources["ReconcileOutboxFunctionRole"]["Properties"][
+            "Policies"
+        ][0]["PolicyDocument"]["Statement"]
+        resources = []
+        for statement in statements:
+            actions = statement["Action"]
+            if "dynamodb:Query" in (
+                actions if isinstance(actions, list) else [actions]
+            ):
+                resource = statement["Resource"]
+                resources.extend(resource if isinstance(resource, list) else [resource])
+        self.assertIn({"Fn::GetAtt": ["OutboxTable", "Arn"]}, resources)
+        self.assertIn(
+            {"Fn::Sub": "${OutboxTable.Arn}/index/PendingByNextAttempt"}, resources
+        )
+        self.assertEqual(len(resources), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

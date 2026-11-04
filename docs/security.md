@@ -22,6 +22,8 @@ Cognito uses the Lite tier, code flow, a public client with no secret, fifteen-m
 
 All seven roles have only their own log group's write access. Transactions authorize the underlying item actions on the exact tables; a broad `dynamodb:*` permission is not used. The CodeDeploy role controls only the three exact live aliases and reads this stack's alarms. EventBridge and SNS resource policies restrict the sending resource ARN/account.
 
+The reconciler's `Query` grant includes the outbox table and its one recovery index, as required by [DynamoDB resource authorization](https://docs.aws.amazon.com/service-authorization/latest/reference/list_dynamodb.html). CloudFormation's SNS subscription lifecycle actions use the parent topic ARN, not a subscription ARN; this follows the [SNS authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_sns.html). Both grants remain restricted to this application's resources.
+
 ## Deliberate IAM wildcard exceptions
 
 These exceptions are explicit and checked where applicable; wildcard suffixes in a resource ARN do not grant every AWS service action.

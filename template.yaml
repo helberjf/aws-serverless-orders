@@ -1847,7 +1847,10 @@ Resources:
               - Effect: Allow
                 Action: dynamodb:Query
                 Resource:
-                  Fn::Sub: ${OutboxTable.Arn}/index/PendingByNextAttempt
+                  - Fn::GetAtt:
+                      - OutboxTable
+                      - Arn
+                  - Fn::Sub: ${OutboxTable.Arn}/index/PendingByNextAttempt
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream

@@ -230,7 +230,7 @@ Resources:
                   - sns:SetSubscriptionAttributes
                   - sns:Unsubscribe
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-*:*
+                  Fn::Sub: arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-*
                 Sid: SubscriptionLifecycle
               - Effect: Allow
                 Action:
