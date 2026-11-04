@@ -1,0 +1,10 @@
+{
+  "Records": [
+    {
+      "messageId": "example-message",
+      "body": "{\"orderId\":\"d73b82b5-bcf4-4aae-a3b3-0e726019f8e0\"}",
+      "eventSource": "aws:sqs",
+      "awsRegion": "sa-east-1"
+    }
+  ]
+}

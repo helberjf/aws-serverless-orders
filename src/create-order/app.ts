@@ -1,105 +1,41 @@
-import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-
-import { randomUUID } from 'crypto';
-
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
-
-import {
-    SQSClient,
-    SendMessageCommand,
-} from '@aws-sdk/client-sqs';
-
-const dynamoClient = new DynamoDBClient({});
-
-const documentClient = DynamoDBDocumentClient.from(dynamoClient);
-
-const ORDERS_TABLE = process.env.ORDERS_TABLE!;
-
-const ORDERS_QUEUE_URL =
-    process.env.ORDERS_QUEUE_URL!;
-
-const sqsClient = new SQSClient({});
+import { randomUUID } from 'node:crypto';
+import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { PutCommand } from '@aws-sdk/lib-dynamodb';
+import { documentClient, requiredEnv } from '../shared/clients';
+import { jsonResponse, logError } from '../shared/http';
+import { parseOrderInput } from '../shared/order';
 
 export const lambdaHandler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+    if (!event.body) return jsonResponse(400, { message: 'Request body is required' });
+
+    let body: unknown;
     try {
-        if (!event.body) {
-            return {
-                statusCode: 400,
-                body: JSON.stringify({
-                    message: 'Request body is required',
-                }),
-            };
-        }
+        body = JSON.parse(event.isBase64Encoded ? Buffer.from(event.body, 'base64').toString('utf8') : event.body);
+    } catch {
+        return jsonResponse(400, { message: 'Request body must contain valid JSON' });
+    }
 
-        const body = JSON.parse(event.body);
+    const input = parseOrderInput(body);
+    if (!input) {
+        return jsonResponse(400, {
+            message:
+                'customerId and productId must be non-empty strings (max 128 characters); quantity must be an integer between 1 and 1000',
+        });
+    }
 
-        const { customerId, productId, quantity } = body;
-
-        if (!customerId || !productId || !quantity) {
-            return {
-                statusCode: 400,
-                body: JSON.stringify({
-                    message: 'customerId, productId and quantity are required',
-                }),
-            };
-        }
-
-        const order = {
-            orderId: randomUUID(),
-
-            customerId,
-
-            productId,
-
-            quantity,
-
-            status: 'RECEIVED',
-
-            createdAt: new Date().toISOString(),
-        };
-
+    const order = { orderId: randomUUID(), ...input, status: 'RECEIVED', createdAt: new Date().toISOString() };
+    try {
+        // The committed insert is the source of the stream event: no database/SQS dual write.
         await documentClient.send(
             new PutCommand({
-                TableName: ORDERS_TABLE,
-
+                TableName: requiredEnv('ORDERS_TABLE'),
                 Item: order,
+                ConditionExpression: 'attribute_not_exists(orderId)',
             }),
         );
-
-        await sqsClient.send(
-            new SendMessageCommand({
-                QueueUrl: ORDERS_QUEUE_URL,
-            
-                MessageBody: JSON.stringify({
-                
-                    orderId: order.orderId,
-                
-                }),
-            
-            }),
-        
-        );
-
-        return {
-            statusCode: 201,
-
-            headers: {
-                'Content-Type': 'application/json',
-            },
-
-            body: JSON.stringify(order),
-        };
+        return jsonResponse(201, order);
     } catch (error) {
-        console.error('Error creating order:', error);
-
-        return {
-            statusCode: 500,
-
-            body: JSON.stringify({
-                message: 'Internal server error',
-            }),
-        };
+        logError('create_order_failed', error, { requestId: event.requestContext?.requestId });
+        return jsonResponse(500, { message: 'Internal server error' });
     }
 };
