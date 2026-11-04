@@ -242,6 +242,10 @@ Resources:
         Sourcemap: false
         EntryPoints:
           - src/publish-order/app.ts
+    DependsOn:
+      - OrdersProcessedRule
+      - OrdersEventQueuePolicy
+      - NotificationAuditSubscription
   ProcessOrderFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -542,11 +546,261 @@ Resources:
         Sourcemap: false
         EntryPoints:
           - src/reconcile-outbox/app.ts
+    DependsOn:
+      - OrdersProcessedRule
+      - OrdersEventQueuePolicy
+      - NotificationAuditSubscription
   ReconcileOutboxLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName:
         Fn::Sub: /aws/lambda/${AWS::StackName}/reconcile-outbox
+      RetentionInDays: 14
+  NotificationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  EventDeliveryDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  NotificationDeliveryDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  NotificationAuditQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600
+  NotificationsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 181
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+            - NotificationDeadLetterQueue
+            - Arn
+        maxReceiveCount: 5
+  OrdersProcessedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName:
+        Ref: OrdersEventBus
+      EventPattern:
+        source:
+          - com.helberjf.orders
+        detail-type:
+          - OrderProcessed
+        detail:
+          schemaVersion:
+            - 1
+      Targets:
+        - Id: Notifications
+          Arn:
+            Fn::GetAtt:
+              - NotificationsQueue
+              - Arn
+          DeadLetterConfig:
+            Arn:
+              Fn::GetAtt:
+                - EventDeliveryDeadLetterQueue
+                - Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 86400
+            MaximumRetryAttempts: 185
+  OrdersEventQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - Ref: NotificationsQueue
+        - Ref: EventDeliveryDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource:
+              - Fn::GetAtt:
+                  - NotificationsQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - EventDeliveryDeadLetterQueue
+                  - Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  Fn::GetAtt:
+                    - OrdersProcessedRule
+                    - Arn
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+  NotificationAuditQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - Ref: NotificationAuditQueue
+        - Ref: NotificationDeliveryDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource:
+              - Fn::GetAtt:
+                  - NotificationAuditQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - NotificationDeliveryDeadLetterQueue
+                  - Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  Ref: NotificationsTopic
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+  NotificationAuditSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: NotificationAuditQueuePolicy
+    Properties:
+      TopicArn:
+        Ref: NotificationsTopic
+      Protocol: sqs
+      Endpoint:
+        Fn::GetAtt:
+          - NotificationAuditQueue
+          - Arn
+      RawMessageDelivery: true
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+            - NotificationDeliveryDeadLetterQueue
+            - Arn
+  NotificationReceiptsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+  TestEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasTestEmail
+    Properties:
+      TopicArn:
+        Ref: NotificationsTopic
+      Protocol: email
+      Endpoint:
+        Ref: TestNotificationEmail
+  NotifyOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/notify-order/app.lambdaHandler
+      LoggingConfig:
+        LogGroup:
+          Ref: NotifyOrderLogGroup
+      Timeout: 30
+      Environment:
+        Variables:
+          OUTBOX_TABLE:
+            Ref: OutboxTable
+          NOTIFICATION_RECEIPTS_TABLE:
+            Ref: NotificationReceiptsTable
+      Policies:
+        - SQSPollerPolicy:
+            QueueName:
+              Fn::GetAtt:
+                - NotificationsQueue
+                - QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+              Resource:
+                - Fn::GetAtt:
+                    - NotificationReceiptsTable
+                    - Arn
+                - Fn::GetAtt:
+                    - OutboxTable
+                    - Arn
+      Events:
+        Notifications:
+          Type: SQS
+          Properties:
+            Queue:
+              Fn::GetAtt:
+                - NotificationsQueue
+                - Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: 5
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        EntryPoints:
+          - src/notify-order/app.ts
+  NotifyOrderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/notify-order
+      RetentionInDays: 14
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/health/app.lambdaHandler
+      LoggingConfig:
+        LogGroup:
+          Ref: HealthLogGroup
+      Events:
+        Health:
+          Type: Api
+          Properties:
+            Path: /health
+            Method: get
+            Auth:
+              Authorizer: NONE
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        EntryPoints:
+          - src/health/app.ts
+  HealthLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/health
       RetentionInDays: 14
 Outputs:
   OrdersApi:
@@ -611,3 +865,38 @@ Outputs:
     Description: NotificationsTopic
     Value:
       Ref: NotificationsTopic
+  NotificationsQueueUrl:
+    Description: NotificationsQueue
+    Value:
+      Ref: NotificationsQueue
+  NotificationDeadLetterQueueUrl:
+    Description: NotificationDeadLetterQueue
+    Value:
+      Ref: NotificationDeadLetterQueue
+  EventDeliveryDeadLetterQueueUrl:
+    Description: EventDeliveryDeadLetterQueue
+    Value:
+      Ref: EventDeliveryDeadLetterQueue
+  NotificationAuditQueueUrl:
+    Description: NotificationAuditQueue
+    Value:
+      Ref: NotificationAuditQueue
+  NotificationDeliveryDeadLetterQueueUrl:
+    Description: NotificationDeliveryDeadLetterQueue
+    Value:
+      Ref: NotificationDeliveryDeadLetterQueue
+  ApiBaseUrl:
+    Description: API base URL
+    Value:
+      Fn::Sub: https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod
+Parameters:
+  TestNotificationEmail:
+    Type: String
+    Default: ''
+    Description: Optional, explicitly approved test subscription. Leave empty to send no email.
+Conditions:
+  HasTestEmail:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: TestNotificationEmail
+          - ''

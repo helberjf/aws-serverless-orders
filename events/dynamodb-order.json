@@ -1,11 +1,15 @@
 {
   "Records": [
     {
-      "eventID": "example-insert",
+      "eventID": "example-outbox-insert",
       "eventName": "INSERT",
       "eventSource": "aws:dynamodb",
       "dynamodb": {
-        "Keys": { "orderId": { "S": "d73b82b5-bcf4-4aae-a3b3-0e726019f8e0" } },
+        "Keys": {
+          "eventId": {
+            "S": "OrderCreated:d73b82b5-bcf4-4aae-a3b3-0e726019f8e0"
+          }
+        },
         "SequenceNumber": "1",
         "StreamViewType": "KEYS_ONLY"
       }

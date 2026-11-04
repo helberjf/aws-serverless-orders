@@ -70,12 +70,13 @@ export async function dispatchOutbox(eventId: string): Promise<void> {
     try {
         const detail = { ...record.detail, eventId, orderId: record.orderId, schemaVersion: 1 };
         if (record.eventType === 'OrderCreated') {
-            await sqsClient.send(
+            const sent = await sqsClient.send(
                 new SendMessageCommand({
                     QueueUrl: requiredEnv('ORDERS_QUEUE_URL'),
                     MessageBody: JSON.stringify(detail),
                 }),
             );
+            if (!sent.MessageId) throw new Error('SQS did not acknowledge the message');
         } else if (record.eventType === 'OrderProcessed') {
             const result = await eventBridgeClient.send(
                 new PutEventsCommand({
@@ -93,7 +94,7 @@ export async function dispatchOutbox(eventId: string): Promise<void> {
             if (result.FailedEntryCount || !result.Entries?.[0]?.EventId)
                 throw new Error('EventBridge rejected the event');
         } else {
-            await snsClient.send(
+            const sent = await snsClient.send(
                 new PublishCommand({
                     TopicArn: requiredEnv('NOTIFICATIONS_TOPIC_ARN'),
                     Subject: 'Order ready for fulfillment',
@@ -101,6 +102,7 @@ export async function dispatchOutbox(eventId: string): Promise<void> {
                     MessageAttributes: { eventId: { DataType: 'String', StringValue: eventId } },
                 }),
             );
+            if (!sent.MessageId) throw new Error('SNS did not acknowledge the notification');
         }
         await documentClient.send(
             new UpdateCommand({

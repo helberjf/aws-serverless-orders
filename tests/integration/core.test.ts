@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { SendMessageCommand } from '@aws-sdk/client-sqs';
+import { PutEventsCommand } from '@aws-sdk/client-eventbridge';
 import { CreateTableCommand, DeleteTableCommand, DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
-import { documentClient, eventBridgeClient, sqsClient } from '../../src/shared/clients';
+import { documentClient, eventBridgeClient, snsClient, sqsClient } from '../../src/shared/clients';
 import { lambdaHandler as create } from '../../src/create-order/app';
 import { lambdaHandler as get } from '../../src/get-order/app';
 import { lambdaHandler as process } from '../../src/process-order/app';
+import { lambdaHandler as notify } from '../../src/notify-order/app';
 import { dispatchOutbox } from '../../src/shared/outbox';
 import { apiEvent, input, sqsEvent } from '../support';
 
@@ -90,6 +92,18 @@ describe('DynamoDB Local transactions across real handlers', () => {
             .mockResolvedValue({ FailedEntryCount: 0, Entries: [{ EventId: 'accepted' }] } as never);
         await dispatchOutbox(`OrderProcessed:${order.orderId}`);
         expect(publish).toHaveBeenCalledTimes(1);
+        const published = (publish.mock.calls[0][0] as PutEventsCommand).input.Entries![0];
+        const notification = JSON.stringify({
+            source: published.Source,
+            'detail-type': published.DetailType,
+            detail: JSON.parse(published.Detail!),
+        });
+        expect(await notify(sqsEvent(notification, notification))).toEqual({ batchItemFailures: [] });
+        const sns = vi.spyOn(snsClient, 'send').mockResolvedValue({ MessageId: 'notification-accepted' } as never);
+        await dispatchOutbox(`OrderNotificationRequested:${order.orderId}`);
+        await notify(sqsEvent(notification));
+        await dispatchOutbox(`OrderNotificationRequested:${order.orderId}`);
+        expect(sns).toHaveBeenCalledTimes(1);
         const before = await get(lookup(order.orderId));
         await process(sqsEvent(body, body));
         expect((await get(lookup(order.orderId))).body).toBe(before.body);
