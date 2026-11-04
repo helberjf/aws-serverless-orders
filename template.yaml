@@ -38,7 +38,7 @@ Globals:
     MethodSettings:
       - ResourcePath: /*
         HttpMethod: '*'
-        MetricsEnabled: true
+        MetricsEnabled: false
         DataTraceEnabled: false
         ThrottlingRateLimit: 10
         ThrottlingBurstLimit: 20
@@ -969,6 +969,10 @@ Resources:
               ArnLike:
                 aws:SourceArn:
                   Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*
+      Tags:
+        - Key: Project
+          Value:
+            Ref: AWS::StackName
   AlarmTopic:
     Type: AWS::SNS::Topic
     Condition: HasAlarmEmail

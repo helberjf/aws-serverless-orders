@@ -19,7 +19,9 @@
     "build": "sam build",
     "validate": "sam validate --lint",
     "test:unit": "vitest run --coverage",
-    "test:integration": "vitest run --config vitest.integration.config.ts"
+    "test:integration": "vitest run --config vitest.integration.config.mts",
+    "test:infra": "python -m unittest discover -s tests/infra -v",
+    "test:tooling": "python -m unittest discover -s tests/tooling -v"
   },
   "dependencies": {
     "@aws-lambda-powertools/logger": "^2.36.0",
@@ -31,6 +33,12 @@
     "@aws-sdk/client-sqs": "^3.1161.0",
     "@aws-sdk/lib-dynamodb": "^3.1161.0",
     "zod": "^4.6.7"
+  },
+  "overrides": {
+    "minimatch": "11.0.4"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
   },
   "devDependencies": {
     "@eslint/js": "^10.0.0",

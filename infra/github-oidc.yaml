@@ -1,0 +1,557 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'OIDC bootstrap: separate plan/apply roles, retained artifacts, scoped CloudFormation execution. Deploy
+  only after reviewing docs/deployment.md and costs.'
+Parameters:
+  GitHubRepository:
+    Type: String
+    Default: helberjf/aws-serverless-orders
+    AllowedPattern: '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'
+  ApplicationStackName:
+    Type: String
+    AllowedPattern: '[a-z][a-z0-9-]{2,31}'
+    Description: Exact application stack name; keep development and production separate.
+  EnvironmentName:
+    Type: String
+    AllowedValues:
+      - development
+      - production
+  ExistingGitHubProviderArn:
+    Type: String
+    Default: ''
+    Description: Reuse the account-wide GitHub OIDC provider if present; create it only once per account.
+Conditions:
+  CreateProvider:
+    Fn::Equals:
+      - Ref: ExistingGitHubProviderArn
+      - ''
+Resources:
+  GitHubProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: OldArtifactVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt:
+                  - ArtifactBucket
+                  - Arn
+              - Fn::Sub: ${ArtifactBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /aws-orders-ci/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ApplicationInfrastructure
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ApiGatewayServiceLinkedRole
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/ops.apigateway.amazonaws.com/AWSServiceRoleForAPIGateway
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: ops.apigateway.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:DeleteFunction
+                  - lambda:PublishVersion
+                  - lambda:ListVersionsByFunction
+                  - lambda:CreateAlias
+                  - lambda:GetAlias
+                  - lambda:UpdateAlias
+                  - lambda:DeleteAlias
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:GetPolicy
+                  - lambda:PutFunctionConcurrency
+                  - lambda:DeleteFunctionConcurrency
+                  - lambda:GetFunctionConcurrency
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ApplicationStackName}-*
+                Sid: FunctionLifecycle
+              - Effect: Allow
+                Action:
+                  - lambda:CreateEventSourceMapping
+                Resource: '*'
+                Sid: CreateMappingNeedsWildcard
+                Condition:
+                  ArnLike:
+                    lambda:FunctionArn:
+                      Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ApplicationStackName}-*
+                  StringEquals:
+                    aws:RequestedRegion:
+                      Ref: AWS::Region
+              - Effect: Allow
+                Action:
+                  - lambda:GetEventSourceMapping
+                  - lambda:UpdateEventSourceMapping
+                  - lambda:DeleteEventSourceMapping
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*
+                Sid: MappingLifecycle
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-*
+                Sid: ApplicationRoles
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-*
+                Sid: PassOnlyApplicationRoles
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - lambda.amazonaws.com
+                      - codedeploy.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:UpdateTable
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:UpdateTimeToLive
+                  - dynamodb:TagResource
+                  - dynamodb:UntagResource
+                  - dynamodb:ListTagsOfResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ApplicationStackName}-*
+                Sid: Tables
+              - Effect: Allow
+                Action:
+                  - sqs:CreateQueue
+                  - sqs:DeleteQueue
+                  - sqs:GetQueueAttributes
+                  - sqs:SetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:TagQueue
+                  - sqs:UntagQueue
+                  - sqs:ListQueueTags
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-*
+                Sid: Queues
+              - Effect: Allow
+                Action:
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetTopicAttributes
+                  - sns:SetTopicAttributes
+                  - sns:Subscribe
+                  - sns:ListSubscriptionsByTopic
+                  - sns:TagResource
+                  - sns:UntagResource
+                  - sns:ListTagsForResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-*
+                Sid: Topics
+              - Effect: Allow
+                Action:
+                  - sns:GetSubscriptionAttributes
+                  - sns:SetSubscriptionAttributes
+                  - sns:Unsubscribe
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationStackName}-*:*
+                Sid: SubscriptionLifecycle
+              - Effect: Allow
+                Action:
+                  - events:CreateEventBus
+                  - events:DeleteEventBus
+                  - events:DescribeEventBus
+                  - events:UpdateEventBus
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:DescribeRule
+                  - events:EnableRule
+                  - events:DisableRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                  - events:ListTargetsByRule
+                  - events:TagResource
+                  - events:UntagResource
+                  - events:ListTagsForResource
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/${ApplicationStackName}-*
+                  - Fn::Sub: arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${ApplicationStackName}-*
+                  - Fn::Sub: arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${ApplicationStackName}-*/*
+                Sid: EventRouting
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationStackName}/*
+                Sid: LogGroups
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: '*'
+                Sid: DescribeLogGroupsNeedsWildcard
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      Ref: AWS::Region
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                  - cloudwatch:ListTagsForResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ApplicationStackName}-*
+                Sid: Alarms
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:DeleteDashboards
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch::${AWS::AccountId}:dashboard/${ApplicationStackName}-*
+                Sid: Dashboard
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                  - apigateway:POST
+                  - apigateway:PUT
+                  - apigateway:PATCH
+                  - apigateway:DELETE
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis
+                  - Fn::Sub: arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/*
+                  - Fn::Sub: arn:${AWS::Partition}:apigateway:${AWS::Region}::/tags/*
+                Sid: RegionalApiGateway
+              - Effect: Allow
+                Action: cognito-idp:CreateUserPool
+                Resource: '*'
+                Sid: CreateUserPoolNeedsWildcard
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      Ref: AWS::Region
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPool
+                  - cognito-idp:UpdateUserPool
+                  - cognito-idp:DeleteUserPool
+                  - cognito-idp:CreateUserPoolClient
+                  - cognito-idp:DescribeUserPoolClient
+                  - cognito-idp:UpdateUserPoolClient
+                  - cognito-idp:DeleteUserPoolClient
+                  - cognito-idp:CreateResourceServer
+                  - cognito-idp:DescribeResourceServer
+                  - cognito-idp:UpdateResourceServer
+                  - cognito-idp:DeleteResourceServer
+                  - cognito-idp:CreateUserPoolDomain
+                  - cognito-idp:UpdateUserPoolDomain
+                  - cognito-idp:DeleteUserPoolDomain
+                  - cognito-idp:GetUserPoolMfaConfig
+                  - cognito-idp:SetUserPoolMfaConfig
+                  - cognito-idp:TagResource
+                  - cognito-idp:UntagResource
+                  - cognito-idp:ListTagsForResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*
+                Sid: CognitoResources
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateApplication
+                  - codedeploy:DeleteApplication
+                  - codedeploy:GetApplication
+                  - codedeploy:UpdateApplication
+                  - codedeploy:CreateDeploymentGroup
+                  - codedeploy:DeleteDeploymentGroup
+                  - codedeploy:GetDeploymentGroup
+                  - codedeploy:UpdateDeploymentGroup
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:ListDeployments
+                  - codedeploy:TagResource
+                  - codedeploy:UntagResource
+                  - codedeploy:ListTagsForResource
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:GetApplicationRevision
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${ApplicationStackName}-*
+                  - Fn::Sub: arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ApplicationStackName}-*/*
+                Sid: CodeDeploy
+              - Effect: Allow
+                Action: codedeploy:GetDeploymentConfig
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:CodeDeployDefault.LambdaCanary10Percent10Minutes
+                Sid: CanaryConfiguration
+              - Effect: Allow
+                Action:
+                  - kms:CreateKey
+                  - kms:TagResource
+                Resource: '*'
+                Sid: CreateOptionalAlarmKeyNeedsWildcard
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      Ref: AWS::Region
+                    aws:RequestTag/Project:
+                      Ref: ApplicationStackName
+              - Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:GetKeyPolicy
+                  - kms:PutKeyPolicy
+                  - kms:EnableKeyRotation
+                  - kms:DisableKeyRotation
+                  - kms:GetKeyRotationStatus
+                  - kms:ScheduleKeyDeletion
+                  - kms:CancelKeyDeletion
+                  - kms:TagResource
+                  - kms:UntagResource
+                  - kms:ListResourceTags
+                  - kms:UpdateKeyDescription
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
+                Sid: OptionalAlarmKey
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Project:
+                      Ref: ApplicationStackName
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  Fn::Sub: ${ArtifactBucket.Arn}/*
+                Sid: ReadBuildArtifacts
+              - Sid: DomainLookupAndDeploymentControlNeedWildcard
+                Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPoolDomain
+                  - codedeploy:CreateCloudFormationDeployment
+                  - codedeploy:StopDeployment
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      Ref: AWS::Region
+  PlanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /aws-orders-ci/
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated:
+                Fn::If:
+                  - CreateProvider
+                  - Ref: GitHubProvider
+                  - Ref: ExistingGitHubProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub:
+                  Fn::Sub: repo:${GitHubRepository}:environment:${EnvironmentName}-plan
+      Policies:
+        - PolicyName: PlanOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:GetTemplate
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*
+                  - Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  Fn::GetAtt:
+                    - CloudFormationExecutionRole
+                    - Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  Fn::Sub: ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  Fn::GetAtt:
+                    - ArtifactBucket
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - cloudformation:TagResource
+                  - cloudformation:UntagResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /aws-orders-ci/
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated:
+                Fn::If:
+                  - CreateProvider
+                  - Ref: GitHubProvider
+                  - Ref: ExistingGitHubProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub:
+                  Fn::Sub: repo:${GitHubRepository}:environment:${EnvironmentName}
+      Policies:
+        - PolicyName: ExecuteReviewedChangeSet
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:GetTemplate
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*
+              - Effect: Allow
+                Action: cloudformation:ExecuteChangeSet
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*
+              - Effect: Allow
+                Action:
+                  - cloudformation:TagResource
+                  - cloudformation:UntagResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*
+Outputs:
+  PlanRole:
+    Value:
+      Fn::GetAtt:
+        - PlanRole
+        - Arn
+  DeployRole:
+    Value:
+      Fn::GetAtt:
+        - DeployRole
+        - Arn
+  CloudFormationExecutionRole:
+    Value:
+      Fn::GetAtt:
+        - CloudFormationExecutionRole
+        - Arn
+  ArtifactBucket:
+    Value:
+      Ref: ArtifactBucket
+  GitHubProviderArn:
+    Value:
+      Fn::If:
+        - CreateProvider
+        - Ref: GitHubProvider
+        - Ref: ExistingGitHubProviderArn

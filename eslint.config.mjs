@@ -5,7 +5,7 @@ import prettier from 'eslint-config-prettier';
 export default tseslint.config(
     { ignores: ['node_modules/**', 'coverage/**', '.aws-sam/**'] },
     {
-        files: ['**/*.ts'],
+        files: ['**/*.ts', '**/*.mts'],
         extends: [js.configs.recommended, ...tseslint.configs.recommended, prettier],
     },
 );
