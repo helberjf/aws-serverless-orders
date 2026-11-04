@@ -1,0 +1,5 @@
+{
+  "httpMethod": "GET",
+  "path": "/health",
+  "requestContext": { "requestId": "local-health-check" }
+}

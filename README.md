@@ -1,74 +1,122 @@
-# AWS Serverless Orders
+# AWS Serverless Order Processing — Event-Driven Architecture with TypeScript
 
-[![CI](https://github.com/helberjf/aws-serverless-orders/actions/workflows/ci.yml/badge.svg)](https://github.com/helberjf/aws-serverless-orders/actions/workflows/ci.yml)
+A serverless backend that accepts authenticated orders, creates durable fulfillment tickets, and distributes business notifications. It demonstrates transactional consistency, at-least-once delivery, idempotency, least-privilege function roles, and controlled releases using AWS SAM.
 
-An event-driven order-processing API built with **TypeScript, AWS Lambda, API Gateway, DynamoDB Streams, SQS, and AWS SAM**. It demonstrates asynchronous processing, conditional database writes, partial batch retries, dead-letter queues, least-privilege IAM policies, and infrastructure as code.
+**Verification status:** 133 local tests pass, including real DynamoDB Local transactions. SAM validates and builds all seven functions. Live AWS deployment, managed retries/DLQs, Cognito sign-in, and canary rollback have **not** been demonstrated in this environment. GitHub Actions execution is subject to the account billing restriction recorded in [validation evidence](docs/validation.md).
 
-The application accepts an order, persists it as `RECEIVED`, and processes it asynchronously into `PROCESSED`. A second endpoint lets callers check the result. Processing here means an atomic status transition; payment, inventory reservation, and shipping integrations are outside this project's current scope.
+## Project overview
 
-## Architecture
+`POST /orders` commits the order and its publication intent together. A background consumer atomically changes `RECEIVED` to `PROCESSED`, creates a fulfillment ticket, and records an `OrderProcessed` event. EventBridge routes that event to a notification consumer, which creates another durable publication intent for SNS.
+
+`PROCESSED` means **ready for fulfillment**. This project does not charge a card, reserve external inventory, or claim that an order was shipped. There are no artificial processing delays.
+
+## Architecture diagram
 
 ```mermaid
-flowchart LR
-    Client[Signed API client] --> API[API Gateway · AWS IAM]
-    API -->|POST /orders| Create[Create order Lambda]
-    Create -->|conditional insert| Table[(DynamoDB Orders)]
-    Table -->|INSERT events| Stream[DynamoDB Streams]
-    Stream --> Publish[Publish order Lambda]
-    Publish --> Queue[SQS Orders]
-    Queue --> Process[Process order Lambda]
-    Process -->|RECEIVED → PROCESSED| Table
-    API -->|GET /orders/id| Get[Get order Lambda]
-    Get --> Table
-    Queue -. exhausted retries .-> DLQ[Processing DLQ]
-    Stream -. exhausted publishing retries .-> Failures[Failure metadata queue]
+flowchart TD
+    User[Client] --> Cognito[Cognito authorization code + PKCE]
+    Cognito -->|Access token| API[API Gateway REST API]
+    API -->|POST /orders via live alias| Create[CreateOrder Lambda]
+    API -->|GET /orders/:id via live alias| Get[GetOrder Lambda]
+    API -->|GET /health via live alias| Health[Health Lambda]
+    Get --> Orders[(Orders)]
+    Create --> T1[Transaction: order + idempotency response + outbox]
+    T1 --> Orders
+    T1 --> Idem[(Idempotency)]
+    T1 --> Outbox[(Durable outbox)]
+    Outbox -->|DynamoDB Stream INSERT| Publisher[PublishOrder Lambda]
+    Schedule[Every five minutes] --> Recovery[ReconcileOutbox Lambda]
+    Recovery -->|Query due pending records| Outbox
+    Recovery --> Dispatch[Shared conditional-lease dispatcher]
+    Publisher --> Dispatch
+    Dispatch -->|OrderCreated| Queue[SQS OrdersQueue]
+    Queue --> Process[ProcessOrder Lambda]
+    Process --> T2[Transaction: status + fulfillment ticket + outbox]
+    T2 --> Orders
+    T2 --> Tickets[(Fulfillments)]
+    T2 --> Outbox
+    Dispatch -->|OrderProcessed| Bus[EventBridge custom bus + rule]
+    Bus --> NQ[SQS NotificationsQueue]
+    NQ --> Notify[NotifyOrder Lambda]
+    Notify --> T3[Transaction: deduplication receipt + outbox]
+    T3 --> Receipts[(Notification receipts)]
+    T3 --> Outbox
+    Dispatch -->|OrderNotificationRequested| SNS[SNS topic]
+    SNS --> Audit[SQS notification audit subscription]
+    SNS -. Optional confirmed test subscription .-> Email[Test email]
+    Queue --> DLQ[Processing DLQs]
+    NQ --> DLQ
+    Bus -. Failed target delivery .-> EDLQ[Event delivery DLQ]
+    SNS -. Failed subscription delivery .-> SDLQ[Notification delivery DLQ]
+    Publisher -. Exhausted stream retries .-> PDLQ[Stream failure metadata queue]
 ```
 
-The API performs one durable write. The stream publisher sends the committed order ID to SQS, avoiding the original gap where DynamoDB succeeded but SQS failed inside the same HTTP request. Stream publishing and SQS delivery are **at least once**: the consumer uses a conditional update and verifies completed duplicates with a consistent read. It does not promise exactly-once external side effects.
+CloudWatch Logs, embedded metrics, alarms, a dashboard, and X-Ray cover the functions and API. CodeDeploy shifts traffic between immutable versions behind the three HTTP `live` aliases. The outbox is the recovery authority; a stream failure record is diagnostic metadata.
 
-## Implemented behavior
+## Technology stack
 
-- Strict JSON and field validation, including base64 API Gateway request bodies.
-- `POST /orders` persists an order and returns `201` with its ID and initial status.
-- `GET /orders/{orderId}` returns the current order, `404` if absent, or `400` for an invalid ID.
-- Stream filtering plus an application guard prevent status updates from publishing new work.
-- Failed SQS messages are retried individually; successful messages in the same batch are acknowledged.
-- A 30-second consumer timeout, 180-second queue visibility timeout, five receives before the DLQ, and 14-day failure-queue retention.
-- IAM-authorized API, per-function resource permissions, encrypted SQS queues, DynamoDB point-in-time recovery, JSON logs, tracing, and CloudWatch alarms.
-- Unit tests, coverage thresholds, formatting, linting, type checking, SAM validation/build, and GitHub Actions CI.
+| Layer          | Choice                                                                 |
+| -------------- | ---------------------------------------------------------------------- |
+| Runtime        | Node.js 24, TypeScript strict, AWS SDK v3                              |
+| Validation     | Zod                                                                    |
+| Infrastructure | AWS SAM and CloudFormation; esbuild bundles                            |
+| Tests          | Vitest + V8 coverage; DynamoDB Local; offline SAM transformation tests |
+| Operations     | AWS Lambda Powertools for TypeScript, CloudWatch, X-Ray                |
+| Quality        | ESLint, Prettier, Black for Python operator tools, dependency auditing |
+| Delivery       | GitHub Actions, OIDC, reviewed CloudFormation Change Sets, CodeDeploy  |
 
-## Run checks locally
+One root npm package and lockfile serve all handlers. Separate workspaces would add maintenance overhead without a separate release or dependency boundary.
 
-Requirements: Node.js **24.x**, npm, and the [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html). AWS credentials are not needed for the mocked unit tests or local build. Docker is needed only for `sam local` or a container-based build.
+## Key engineering decisions
+
+- **Transactional outbox:** business writes and publication intents commit in the same DynamoDB transaction. External delivery is retryable and may duplicate.
+- **Conditional business effects:** one fulfillment ticket per order; concurrent and duplicate deliveries cannot repeat the committed transition.
+- **Recovery independent of stream retention:** pending outbox records do not expire. A bounded GSI query recovers due work after stream retries or retention are exhausted.
+- **Cognito ownership:** identity comes from the verified token subject, never from the request's `customerId`.
+- **No unnecessary orchestration:** Step Functions is deliberately excluded because the current business operation is one transaction. A payment/reservation saga would introduce a different boundary.
+
+See [architecture decisions](docs/architecture-decisions.md), including migration, storage, duplicate notification, and cost trade-offs.
+
+## AWS services
+
+| Service               | Purpose                                                                            |
+| --------------------- | ---------------------------------------------------------------------------------- |
+| API Gateway + Cognito | REST endpoints, OAuth scopes, JWT signature verification and throttling            |
+| Lambda                | Seven small HTTP, processing, publication, recovery, and notification handlers     |
+| DynamoDB + Streams    | Orders, idempotency responses, fulfillment tickets, outbox, deduplication receipts |
+| SQS Standard          | Work buffering, managed retry, partial batch failures, and dead-letter queues      |
+| EventBridge           | Route the `OrderProcessed` business event to notification processing               |
+| SNS                   | Fan out notifications to an audit queue and optional test email                    |
+| CloudWatch + X-Ray    | Structured logs, metrics, alarms, dashboard and sampled traces                     |
+| CodeDeploy            | HTTP alias traffic shifting and alarm-driven rollback configuration                |
+| IAM, KMS, S3          | Scoped roles, encryption, and versioned deployment artifacts                       |
+
+## REST API endpoints
+
+| Method | Path                | Authorization                                           | Success                                |
+| ------ | ------------------- | ------------------------------------------------------- | -------------------------------------- |
+| POST   | `/orders`           | Cognito access token with `orders/write`                | `201` with original order snapshot     |
+| GET    | `/orders/{orderId}` | Cognito access token with `orders/read`, matching owner | `200` with current order               |
+| GET    | `/health`           | Public                                                  | `200` basic liveness; no database call |
+
+Inputs require trimmed `customerId` and `productId` strings of 1–128 characters, an integer `quantity` from 1–1000, and UUID v4 order IDs. JSON bodies are bounded to 16 KiB. Unknown input fields are discarded by the schema.
+
+After [Cognito login](docs/deployment.md#authenticate-and-run-live-tests), use the deployed `ApiBaseUrl` and a short-lived access token. Do not commit tokens or paste them into logs.
 
 ```bash
-npm ci
-npm run check
-npm run validate
-npm run build
+curl "$API_BASE/health"
+
+curl --request POST "$API_BASE/orders" \
+  --header "Authorization: Bearer $ACCESS_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: demo-order-001' \
+  --data '{"customerId":"customer-123","productId":"product-ABC","quantity":2}'
+
+curl "$API_BASE/orders/d73b82b5-bcf4-4aae-a3b3-0e726019f8e0" \
+  --header "Authorization: Bearer $ACCESS_TOKEN"
 ```
 
-Dependencies and commands live at the repository root. Tests cover validation boundaries, persistence failures, stream checkpoints, duplicate processing, missing orders, poison messages, and partial batch failures. AWS service calls are mocked; passing these checks does not prove a live AWS deployment.
-
-## API contract
-
-Both routes require an IAM principal with `execute-api:Invoke` on the deployed API. Sign HTTP requests with AWS Signature Version 4 for the `execute-api` service in your deployment region. The `ApiInvokeArn` stack output provides the resource ARN for that caller policy.
-
-### Create an order
-
-`POST /orders`, `Content-Type: application/json`
-
-```json
-{
-  "customerId": "customer-123",
-  "productId": "product-ABC",
-  "quantity": 2
-}
-```
-
-Customer and product IDs must be non-empty strings of at most 128 characters after trimming. Quantity must be a JSON integer between 1 and 1000. The service generates the order ID and status; caller-supplied extra fields are ignored.
-
-Example `201` response:
+Illustrative `201` response:
 
 ```json
 {
@@ -77,67 +125,118 @@ Example `201` response:
   "productId": "product-ABC",
   "quantity": 2,
   "status": "RECEIVED",
-  "createdAt": "2026-11-04T10:00:00.000Z"
+  "createdAt": "2026-11-04T12:00:00.000Z",
+  "updatedAt": "2026-11-04T12:00:00.000Z"
 }
 ```
 
-### Read an order
+After processing, GET also returns `processedAt` and `fulfillmentId`, with `status: "PROCESSED"` and the new `updatedAt`. The internal `ownerId` is excluded. Responses include `X-Request-Id`; creation also returns `Idempotency-Key` and `Idempotency-Replayed`.
 
-`GET /orders/d73b82b5-bcf4-4aae-a3b3-0e726019f8e0`
+Errors have `{ "code", "message", "requestId" }`. Expected statuses are `400` invalid input, `401/403` authentication or scope failure, `404` missing or inaccessible order, `409` reuse of an unexpired idempotency key with a different payload, and generic `500` for internal failures. Gateway throttling may return `429`. Stack traces, AWS exception details, and credentials never enter HTTP error responses.
 
-The `200` response contains the same order fields. After successful processing, `status` becomes `PROCESSED` and `processedAt` is added. The consumer preserves this timestamp on duplicate deliveries. Error responses have a JSON `message` field; AWS internal error details are not returned.
+## Event flow
 
-## Deploy and demonstrate
+1. CreateOrder commits an order, its original idempotent response, and `OrderCreated:<orderId>`.
+2. The outbox stream invokes PublishOrder. A conditional lease protects dispatch; the scheduled reconciler uses the same logic.
+3. `OrderCreated` becomes an SQS processing message. The event source mapping polls in batches.
+4. ProcessOrder commits the final status, a `READY_FOR_FULFILLMENT` ticket, and `OrderProcessed:<orderId>` together.
+5. The dispatcher calls EventBridge with source `com.helberjf.orders`, detail type `OrderProcessed`, and versioned detail.
+6. The rule sends the event envelope to NotificationsQueue. NotifyOrder commits a deduplication receipt and `OrderNotificationRequested:<orderId>`.
+7. The dispatcher publishes to SNS. The raw SQS audit subscription makes fan-out observable without any real email recipient.
 
-Configure your AWS account/role, then build and review the deployment change set:
+See [event examples](events/README.md). EventBridge's transport event ID and the stable business `detail.eventId` serve different purposes.
+
+## Idempotency and reliability
+
+Supply the same `Idempotency-Key` on every retry of a creation request. Keys are scoped to the owner, hashed before storage, and valid for 24 hours. Same key plus normalized payload returns the original `201` response, even if the order is already processed. Different payload returns `409`. After expiry, the key may create a new order. For compatibility, omitting the key generates and returns one; a retry that never received that key cannot safely deduplicate.
+
+The processing transaction uses the prior status and `updatedAt` as conditions. Ambiguous write failures are reconciled with a strongly consistent read. The single transaction makes a separate `PROCESSING` lease/state unnecessary.
+
+SQS, EventBridge, and SNS delivery are **at least once**. If a publish succeeds but recording its acknowledgment fails, the outbox can publish again. Conditional consumer transactions prevent duplicate business effects, but a standard SNS subscriber can still receive the same notification more than once. Subscribers must deduplicate the stable event ID when that matters. No exactly-once transport or email guarantee is claimed.
+
+## SQS retry and DLQ strategy
+
+Both consumers use batch size 10, a one-second batching window, 30-second function timeout, and 181-second visibility timeout (`6 × 30 + 1`). `ReportBatchItemFailures` returns only failed message IDs. Five unsuccessful receives lead to a processing DLQ; source retention is four days and DLQ retention is fourteen days.
+
+Outbox stream processing has bounded retries and sends exhausted failure metadata to PublishFailuresQueue. Pending intents survive independently. The reconciler runs every five minutes, queries at most two pages of twenty due items, and applies a 120-second lease and bounded exponential backoff. It performs no table scan. See [recovery runbooks](docs/operations.md) before replaying anything.
+
+## Security and IAM
+
+API Gateway verifies Cognito JWT signatures. Handlers additionally check access-token type, issuer, client ID, expiry, required scope, and ownership. The public client uses authorization code + PKCE, has no client secret, and uses 15-minute access tokens. User self-registration is disabled; the development helper creates test users without invitations.
+
+Each Lambda has its own role, scoped data/service access, and access only to its log group. X-Ray write actions require wildcard resources and are explicitly documented. Queue/topic policies restrict service senders and deny non-TLS requests. DynamoDB, SQS, SNS, and artifact storage use encryption at rest. A customer-managed KMS key is created only when optional alarm email is enabled.
+
+There are no third-party secrets in this application, so Secrets Manager/SSM would add no useful boundary today. Environment values are resource identifiers. Future provider credentials must be retrieved from Secrets Manager or SSM SecureString with a dedicated scoped permission; they must not become SAM parameters or committed environment files. No browser frontend is included, so CORS is not enabled. [Security review and IAM exceptions](docs/security.md) explains the remaining deployment-role privileges.
+
+## Observability
+
+Powertools emits JSON logs with relevant order, request, message, event, status, and duration fields. AWS SDK clients are instrumented for X-Ray. Payloads and tokens are not logged. Asynchronous boundaries are correlated primarily by `orderId` and business event IDs; a single uninterrupted X-Ray trace across all outbox deliveries is not promised.
+
+The stack defines 26 alarms for Lambda errors/throttles, queue depth/age, DLQs, stream iterator age, application failures, and API 5xx rate. A dashboard groups the key signals. Log retention is fourteen days. Detailed per-method API metrics are disabled to control cost; stage metrics support the API alarm. Email alerts are optional and require explicit recipient configuration and SNS confirmation.
+
+## Canary deployment
+
+CreateOrder, GetOrder, and Health use `AutoPublishAlias: live` and `Canary10Percent10Minutes`. SAM generates versions and CodeDeploy deployment groups. Transformed-template tests confirm API integrations target aliases and deployment groups include automatic rollback configuration.
+
+The first deployment establishes the initial version; a subsequent code/configuration change demonstrates traffic splitting. Under low traffic, 10% routing is probabilistic and may produce little evidence. The API 5xx alarm covers handled HTTP failures that would not increment Lambda's `Errors` metric. Follow the [canary and rollback demonstration](docs/deployment.md#verify-canary-and-rollback); live rollback remains unverified until that procedure is completed.
+
+## CI/CD pipeline
+
+Pull requests run clean installation, type checking, lint, formatting, unit coverage, dependency audit, a credential-pattern check, DynamoDB Local integration tests, infrastructure/tooling tests, SAM validation and build, and a check of the built handlers. Coverage is uploaded as an artifact. Third-party actions are pinned to commit SHAs.
+
+Deployment is manual (`workflow_dispatch`) and reuses CI. OIDC plan and apply roles are distinct. The plan job uploads versioned artifacts and creates a Change Set; the apply job executes the exact reviewed ARN/revision. Production requires `main`, explicit GitHub environment branch rules, reviewers, and disabled administrator bypass. The workflow fails closed when those protections are absent. There are no permanent AWS keys in GitHub Secrets.
+
+## Local development
+
+Prerequisites: Node.js 24, Python 3.12, Git, and Docker. Activate a Python virtual environment before installing the pinned tooling:
 
 ```bash
-aws sts get-caller-identity
+python -m venv .venv
+# Linux/macOS: source .venv/bin/activate
+# PowerShell: .\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-dev.txt
+npm ci
+npm run check
+docker compose up -d
+python scripts/wait-dynamodb.py
+npm run test:integration
+npm run test:infra
+npm run test:tooling
+sam validate --lint --region sa-east-1
 npm run build
-sam deploy --guided
+node scripts/check-build.cjs
 ```
 
-The checked-in defaults use stack name `aws-serverless-orders` and region `sa-east-1`. Deployment creates billable AWS resources; select the account and region deliberately. The table is retained on deletion. See the [upgrade and cleanup notes](docs/operations.md) if an earlier version is already deployed.
+DynamoDB Local binds only to `127.0.0.1:18000`. Integration tests create isolated tables and delete only those tables on the guarded loopback endpoint. They do not access AWS. When the local lab is no longer needed, `docker compose down` stops this repository's disposable local service. Do not use production credentials for local tests.
 
-To exercise the actual deployed pipeline, install Boto3 and run the signed smoke test with a role permitted to describe the stack and invoke its API:
+## Testing
 
-```bash
-python -m pip install boto3
-python scripts/smoke-test.py --stack-name aws-serverless-orders --region sa-east-1
-```
+| Level                      | What it verifies                                                                                                     | What it does not prove                                                                       |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Unit: 101 tests            | Validation, authorization, races, retries, ambiguous outcomes, partial batches, event publication and telemetry      | AWS service integration                                                                      |
+| Local integration: 6 tests | Real DynamoDB transactions through HTTP/worker handlers; concurrency, rollback, ownership and replay                 | Managed Streams, SQS polling, EventBridge, SNS or Cognito; those transports are test doubles |
+| Infrastructure: 11 tests   | Expanded SAM aliases, canary/rollback configuration, scopes, queue settings, role boundaries, OIDC workflow controls | Actual AWS IAM authorization or runtime rollout                                              |
+| Tooling: 15 tests          | Change-set identity, parameter preservation, plan/apply separation and production protection checks                  | Real GitHub approval or CloudFormation execution                                             |
+| Live E2E: operator-run     | API, Cognito, SQS/Streams, fulfillment, EventBridge/SNS, optional DLQ                                                | Not executed here; requires approved development deployment                                  |
 
-The smoke test creates one demo order, polls its status for up to 90 seconds, and exits unsuccessfully if processing does not finish. It uses the normal AWS credential chain, including `AWS_PROFILE` and temporary session credentials. It leaves the demo order in DynamoDB. Only run this command against the intended deployed stack; it is not part of CI and has not been run merely by installing the project.
+Measured coverage: **100% lines, 99.21% statements, 100% functions, 93.75% branches**. Thresholds are 90% lines/statements/functions and 85% branches. All critical handlers have 100% measured line coverage. Coverage is a regression signal, not proof of distributed-system correctness. [Evidence and outstanding checks](docs/validation.md) records the actual scope.
 
-The `events/` directory includes API, DynamoDB stream, and SQS examples for `sam local invoke`. Local Lambda emulation does **not** automatically emulate DynamoDB/SQS or connect the event sources. Provide environment overrides with actual resource names and use the unit tests for an entirely offline check.
+## AWS deployment
 
-## Reliability boundaries
+Review [estimated costs](docs/costs.md) first. Use [deployment instructions](docs/deployment.md) to provision the OIDC bootstrap from CloudFormation, configure the GitHub environments, review the application Change Set, and deploy development. Production deployment and recurring-cost resources require owner authorization.
 
-- HTTP request retries are not deduplicated: each valid `POST` creates a new order. Add a client idempotency key before using the API for purchases.
-- Idempotency currently protects the database status transition. External payment or fulfillment services need their own idempotency and reconciliation strategy.
-- DynamoDB Streams retain events for 24 hours. Publishing retries are bounded; failures and expired streams require reconciliation from persisted `RECEIVED` orders. The publisher failure queue contains metadata, not replayable order payloads.
-- IAM controls API access for trusted callers. Customer-level authorization and tenant isolation are not implemented.
-- CloudWatch alarms have no notification actions until an operator configures them. There is no automatic deployment or claim of a production rollout.
+Do not automatically merge or deploy this branch. Existing installations must review the [Cognito and outbox migration notes](docs/deployment.md#migrating-an-existing-stack).
 
-The [operations guide](docs/operations.md) covers monitoring, DLQ redrive, publishing recovery, migration, and cleanup.
+## Estimated cost and cleanup
 
-## Repository layout
+For a small São Paulo lab, budget approximately **US$10–15/month per continuously deployed environment**, before taxes, without assuming credits or free allowances. This is a planning range, not a cap: alarms, metrics, dashboard, polling, logs, retained data, traffic and retries affect it. Optional alarm encryption adds a customer-managed KMS key charge. Two environments increase the budget accordingly. See [assumptions and current price references](docs/costs.md).
 
-```text
-src/create-order/    HTTP validation and conditional persistence
-src/get-order/       Strongly consistent status lookup
-src/publish-order/   DynamoDB Streams → SQS
-src/process-order/   Idempotent SQS consumer
-src/shared/         AWS clients, validation and response helpers
-tests/              Unit tests with mocked AWS clients
-events/             Sample invocation payloads
-scripts/            Signed live-deployment smoke test
-docs/operations.md  Recovery and deployment notes
-template.yaml       AWS SAM infrastructure
-.github/workflows/  Continuous integration (no AWS credentials)
-```
+No NAT Gateway, ECS, RDS, ALB, or provisioned concurrency is created. Cleanup requires authorization: `sam delete` removes stack resources and queue/log data, while retained DynamoDB tables, the user pool, OIDC provider and artifact bucket need a separate reviewed cleanup decision. See the [cleanup runbook](docs/operations.md#cleanup).
 
-## Design references
+## Trade-offs and future improvements
 
-- [AWS Lambda with SQS: visibility timeout and retries](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-configure.html)
-- [Partial batch responses for DynamoDB Streams](https://docs.aws.amazon.com/lambda/latest/dg/services-ddb-batchfailurereporting.html)
-- [DynamoDB stream failure destinations and retention limits](https://docs.aws.amazon.com/lambda/latest/dg/services-dynamodb-errors.html)
+The recovery index has a single `PENDING` partition suitable for a portfolio workload; shard it before large-scale use. The reconciler's bounded throughput favors predictable cost over rapid bulk recovery. Notification receipts are permanent to protect late replay and need an eventual retention policy tied to business requirements. All three outbox event types share publishing permissions. An external payment provider would require its own idempotency contract and likely an orchestration saga.
+
+Additional production work depends on requirements: load/SLO testing, custom domain/WAF, mandatory MFA, backup restoration drills, security review in the target account, larger recovery capacity, and privacy/deletion workflows. The project does not claim these are already implemented.
+
+Repository presentation text and a DVA-C02 competency map are in [portfolio notes](docs/portfolio.md).
