@@ -1,139 +1,296 @@
 AWSTemplateFormatVersion: '2010-09-09'
-
 Transform: AWS::Serverless-2016-10-31
-
-Description: >
-  Serverless order processing system built with AWS SAM.
+Description: Event-driven order processing with DynamoDB Streams, SQS and idempotent Lambda consumers.
 
 Globals:
   Function:
-    Timeout: 5
+    Timeout: 10
+    MemorySize: 256
     Runtime: nodejs24.x
-    Architectures:
-      - x86_64
+    Architectures: [x86_64]
     Tracing: Active
     LoggingConfig:
       LogFormat: JSON
-
   Api:
     TracingEnabled: true
-
+    Auth:
+      DefaultAuthorizer: AWS_IAM
 
 Resources:
-
-  # ==============================
-  # DynamoDB
-  # ==============================
-
   OrdersTable:
     Type: AWS::DynamoDB::Table
-
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-
       BillingMode: PAY_PER_REQUEST
-
       AttributeDefinitions:
         - AttributeName: orderId
           AttributeType: S
-
       KeySchema:
         - AttributeName: orderId
           KeyType: HASH
+      StreamSpecification:
+        StreamViewType: KEYS_ONLY
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
 
+  OrdersDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
 
-  # ==============================
-  # SQS
-  # ==============================
+  PublishFailuresQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
 
   OrdersQueue:
     Type: AWS::SQS::Queue
-
     Properties:
-      VisibilityTimeout: 30
-
-  # ==============================
-  # Create Order Lambda
-  # ==============================
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDeadLetterQueue.Arn
+        maxReceiveCount: 5
 
   CreateOrderFunction:
-
     Type: AWS::Serverless::Function
-
     Properties:
-
-      CodeUri: src/create-order/
-
-      Handler: app.lambdaHandler
-
+      CodeUri: .
+      Handler: src/create-order/app.lambdaHandler
+      LoggingConfig:
+        LogGroup: !Ref CreateOrderLogGroup
       Environment:
         Variables:
           ORDERS_TABLE: !Ref OrdersTable
-          ORDERS_QUEUE_URL: !Ref OrdersQueue
-
       Policies:
-        - DynamoDBWritePolicy:
-            TableName: !Ref OrdersTable
-        - SQSSendMessagePolicy:
-            QueueName: !GetAtt OrdersQueue.QueueName
-
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt OrdersTable.Arn
       Events:
-
         CreateOrderApi:
-
           Type: Api
-
           Properties:
-
             Path: /orders
             Method: post
-
-
     Metadata:
-
       BuildMethod: esbuild
-
       BuildProperties:
-
         Minify: true
-        Target: es2020
-        Sourcemap: true
+        Target: es2022
+        Sourcemap: false
+        EntryPoints: [src/create-order/app.ts]
 
-        EntryPoints:
-          - app.ts
+  GetOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/get-order/app.lambdaHandler
+      LoggingConfig:
+        LogGroup: !Ref GetOrderLogGroup
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt OrdersTable.Arn
+      Events:
+        GetOrderApi:
+          Type: Api
+          Properties:
+            Path: /orders/{orderId}
+            Method: get
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        EntryPoints: [src/get-order/app.ts]
 
+  PublishOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/publish-order/app.lambdaHandler
+      LoggingConfig:
+        LogGroup: !Ref PublishOrderLogGroup
+      Timeout: 30
+      Environment:
+        Variables:
+          ORDERS_QUEUE_URL: !Ref OrdersQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OrdersQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt PublishFailuresQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:DescribeStream
+                - dynamodb:GetRecords
+                - dynamodb:GetShardIterator
+                - dynamodb:ListStreams
+              Resource: !GetAtt OrdersTable.StreamArn
+      Events:
+        OrderInserted:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt OrdersTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            MaximumRetryAttempts: 10
+            MaximumRecordAgeInSeconds: 3600
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName":["INSERT"]}'
+            DestinationConfig:
+              OnFailure:
+                Type: SQS
+                Destination: !GetAtt PublishFailuresQueue.Arn
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        EntryPoints: [src/publish-order/app.ts]
+
+  ProcessOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/process-order/app.lambdaHandler
+      LoggingConfig:
+        LogGroup: !Ref ProcessOrderLogGroup
+      Timeout: 30
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt OrdersQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:UpdateItem, dynamodb:GetItem]
+              Resource: !GetAtt OrdersTable.Arn
+      Events:
+        Orders:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrdersQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 5
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        EntryPoints: [src/process-order/app.ts]
+
+  CreateOrderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/create-order
+      RetentionInDays: 14
+  GetOrderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/get-order
+      RetentionInDays: 14
+  PublishOrderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/publish-order
+      RetentionInDays: 14
+  ProcessOrderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/process-order
+      RetentionInDays: 14
+
+  OrdersDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Orders exhausted processing retries. Follow docs/operations.md.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrdersDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  PublishFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Stream publishing failed. Inspect metadata and reconcile RECEIVED orders.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt PublishFailuresQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  OrderBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Orders have been waiting more than five minutes.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrdersQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
 
 Outputs:
-
   OrdersApi:
-
-    Description: API Gateway endpoint for creating orders
-
-    Value: !Sub >
-      https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/orders
-
-
+    Description: IAM-authorized API endpoint for POST orders and GET orders/{orderId}
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/orders
   OrdersTableName:
-
     Description: DynamoDB Orders table
-
     Value: !Ref OrdersTable
-
-
   CreateOrderFunctionArn:
-
     Description: Create Order Lambda ARN
-
     Value: !GetAtt CreateOrderFunction.Arn
-  
   OrdersQueueUrl:
-
     Description: SQS Orders Queue URL
-
     Value: !Ref OrdersQueue
-
-
   OrdersQueueArn:
-
     Description: SQS Orders Queue ARN
-
     Value: !GetAtt OrdersQueue.Arn
+  OrdersDeadLetterQueueUrl:
+    Description: Failed processing messages (safe to redrive after fixing the cause)
+    Value: !Ref OrdersDeadLetterQueue
+  OrdersDeadLetterQueueArn:
+    Description: Failed processing queue ARN for redrive
+    Value: !GetAtt OrdersDeadLetterQueue.Arn
+  PublishFailuresQueueUrl:
+    Description: Stream failure metadata (not directly replayable order messages)
+    Value: !Ref PublishFailuresQueue
+  ApiInvokeArn:
+    Description: Resource ARN for callers with execute-api:Invoke permission
+    Value: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ServerlessRestApi}/Prod/*/orders*

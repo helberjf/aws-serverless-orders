@@ -1,0 +1,14 @@
+{
+  "Records": [
+    {
+      "eventID": "example-insert",
+      "eventName": "INSERT",
+      "eventSource": "aws:dynamodb",
+      "dynamodb": {
+        "Keys": { "orderId": { "S": "d73b82b5-bcf4-4aae-a3b3-0e726019f8e0" } },
+        "SequenceNumber": "1",
+        "StreamViewType": "KEYS_ONLY"
+      }
+    }
+  ]
+}

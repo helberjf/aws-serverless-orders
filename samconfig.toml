@@ -7,7 +7,8 @@ stack_name = "aws-serverless-orders"
 region = "sa-east-1"
 
 [default.build.parameters]
-cached = true
+# Avoid copying long dependency-cache paths on Windows; esbuild bundles each function.
+cached = false
 parallel = true
 
 [default.validate.parameters]

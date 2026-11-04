@@ -1,127 +1,143 @@
-# aws-serverless-orders
+# AWS Serverless Orders
 
-This project contains source code and supporting files for a serverless application that you can deploy with the SAM CLI. It includes the following files and folders.
+[![CI](https://github.com/helberjf/aws-serverless-orders/actions/workflows/ci.yml/badge.svg)](https://github.com/helberjf/aws-serverless-orders/actions/workflows/ci.yml)
 
-- hello-world - Code for the application's Lambda function written in TypeScript.
-- events - Invocation events that you can use to invoke the function.
-- hello-world/tests - Unit tests for the application code. 
-- template.yaml - A template that defines the application's AWS resources.
+An event-driven order-processing API built with **TypeScript, AWS Lambda, API Gateway, DynamoDB Streams, SQS, and AWS SAM**. It demonstrates asynchronous processing, conditional database writes, partial batch retries, dead-letter queues, least-privilege IAM policies, and infrastructure as code.
 
-The application uses several AWS resources, including Lambda functions and an API Gateway API. These resources are defined in the `template.yaml` file in this project. You can update the template to add AWS resources through the same deployment process that updates your application code.
+The application accepts an order, persists it as `RECEIVED`, and processes it asynchronously into `PROCESSED`. A second endpoint lets callers check the result. Processing here means an atomic status transition; payment, inventory reservation, and shipping integrations are outside this project's current scope.
 
-If you prefer to use an integrated development environment (IDE) to build and test your application, you can use the AWS Toolkit.  
-The AWS Toolkit is an open source plug-in for popular IDEs that uses the SAM CLI to build and deploy serverless applications on AWS. The AWS Toolkit also adds a simplified step-through debugging experience for Lambda function code. See the following links to get started.
+## Architecture
 
-* [CLion](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [GoLand](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [IntelliJ](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [WebStorm](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [Rider](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [PhpStorm](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [PyCharm](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [RubyMine](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [DataGrip](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [VS Code](https://docs.aws.amazon.com/toolkit-for-vscode/latest/userguide/welcome.html)
-* [Visual Studio](https://docs.aws.amazon.com/toolkit-for-visual-studio/latest/user-guide/welcome.html)
+```mermaid
+flowchart LR
+    Client[Signed API client] --> API[API Gateway · AWS IAM]
+    API -->|POST /orders| Create[Create order Lambda]
+    Create -->|conditional insert| Table[(DynamoDB Orders)]
+    Table -->|INSERT events| Stream[DynamoDB Streams]
+    Stream --> Publish[Publish order Lambda]
+    Publish --> Queue[SQS Orders]
+    Queue --> Process[Process order Lambda]
+    Process -->|RECEIVED → PROCESSED| Table
+    API -->|GET /orders/id| Get[Get order Lambda]
+    Get --> Table
+    Queue -. exhausted retries .-> DLQ[Processing DLQ]
+    Stream -. exhausted publishing retries .-> Failures[Failure metadata queue]
+```
 
-## Deploy the sample application
+The API performs one durable write. The stream publisher sends the committed order ID to SQS, avoiding the original gap where DynamoDB succeeded but SQS failed inside the same HTTP request. Stream publishing and SQS delivery are **at least once**: the consumer uses a conditional update and verifies completed duplicates with a consistent read. It does not promise exactly-once external side effects.
 
-The Serverless Application Model Command Line Interface (SAM CLI) is an extension of the AWS CLI that adds functionality for building and testing Lambda applications. It uses Docker to run your functions in an Amazon Linux environment that matches Lambda. It can also emulate your application's build environment and API.
+## Implemented behavior
 
-To use the SAM CLI, you need the following tools.
+- Strict JSON and field validation, including base64 API Gateway request bodies.
+- `POST /orders` persists an order and returns `201` with its ID and initial status.
+- `GET /orders/{orderId}` returns the current order, `404` if absent, or `400` for an invalid ID.
+- Stream filtering plus an application guard prevent status updates from publishing new work.
+- Failed SQS messages are retried individually; successful messages in the same batch are acknowledged.
+- A 30-second consumer timeout, 180-second queue visibility timeout, five receives before the DLQ, and 14-day failure-queue retention.
+- IAM-authorized API, per-function resource permissions, encrypted SQS queues, DynamoDB point-in-time recovery, JSON logs, tracing, and CloudWatch alarms.
+- Unit tests, coverage thresholds, formatting, linting, type checking, SAM validation/build, and GitHub Actions CI.
 
-* SAM CLI - [Install the SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-install.html)
-* Node.js - [Install Node.js 24](https://nodejs.org/en/), including the NPM package management tool.
-* Docker - [Install Docker community edition](https://hub.docker.com/search/?type=edition&offering=community)
+## Run checks locally
 
-To build and deploy your application for the first time, run the following in your shell:
+Requirements: Node.js **24.x**, npm, and the [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html). AWS credentials are not needed for the mocked unit tests or local build. Docker is needed only for `sam local` or a container-based build.
 
 ```bash
-sam build
+npm ci
+npm run check
+npm run validate
+npm run build
+```
+
+Dependencies and commands live at the repository root. Tests cover validation boundaries, persistence failures, stream checkpoints, duplicate processing, missing orders, poison messages, and partial batch failures. AWS service calls are mocked; passing these checks does not prove a live AWS deployment.
+
+## API contract
+
+Both routes require an IAM principal with `execute-api:Invoke` on the deployed API. Sign HTTP requests with AWS Signature Version 4 for the `execute-api` service in your deployment region. The `ApiInvokeArn` stack output provides the resource ARN for that caller policy.
+
+### Create an order
+
+`POST /orders`, `Content-Type: application/json`
+
+```json
+{
+  "customerId": "customer-123",
+  "productId": "product-ABC",
+  "quantity": 2
+}
+```
+
+Customer and product IDs must be non-empty strings of at most 128 characters after trimming. Quantity must be a JSON integer between 1 and 1000. The service generates the order ID and status; caller-supplied extra fields are ignored.
+
+Example `201` response:
+
+```json
+{
+  "orderId": "d73b82b5-bcf4-4aae-a3b3-0e726019f8e0",
+  "customerId": "customer-123",
+  "productId": "product-ABC",
+  "quantity": 2,
+  "status": "RECEIVED",
+  "createdAt": "2026-11-04T10:00:00.000Z"
+}
+```
+
+### Read an order
+
+`GET /orders/d73b82b5-bcf4-4aae-a3b3-0e726019f8e0`
+
+The `200` response contains the same order fields. After successful processing, `status` becomes `PROCESSED` and `processedAt` is added. The consumer preserves this timestamp on duplicate deliveries. Error responses have a JSON `message` field; AWS internal error details are not returned.
+
+## Deploy and demonstrate
+
+Configure your AWS account/role, then build and review the deployment change set:
+
+```bash
+aws sts get-caller-identity
+npm run build
 sam deploy --guided
 ```
 
-The first command will build the source of your application. The second command will package and deploy your application to AWS, with a series of prompts:
+The checked-in defaults use stack name `aws-serverless-orders` and region `sa-east-1`. Deployment creates billable AWS resources; select the account and region deliberately. The table is retained on deletion. See the [upgrade and cleanup notes](docs/operations.md) if an earlier version is already deployed.
 
-* **Stack Name**: The name of the stack to deploy to CloudFormation. This should be unique to your account and region, and a good starting point would be something matching your project name.
-* **AWS Region**: The AWS region you want to deploy your app to.
-* **Confirm changes before deploy**: If set to yes, any change sets will be shown to you before execution for manual review. If set to no, the AWS SAM CLI will automatically deploy application changes.
-* **Allow SAM CLI IAM role creation**: Many AWS SAM templates, including this example, create AWS IAM roles required for the AWS Lambda function(s) included to access AWS services. By default, these are scoped down to minimum required permissions. To deploy an AWS CloudFormation stack which creates or modifies IAM roles, the `CAPABILITY_IAM` value for `capabilities` must be provided. If permission isn't provided through this prompt, to deploy this example you must explicitly pass `--capabilities CAPABILITY_IAM` to the `sam deploy` command.
-* **Save arguments to samconfig.toml**: If set to yes, your choices will be saved to a configuration file inside the project, so that in the future you can just re-run `sam deploy` without parameters to deploy changes to your application.
-
-You can find your API Gateway Endpoint URL in the output values displayed after deployment.
-
-## Use the SAM CLI to build and test locally
-
-Build your application with the `sam build` command.
+To exercise the actual deployed pipeline, install Boto3 and run the signed smoke test with a role permitted to describe the stack and invoke its API:
 
 ```bash
-aws-serverless-orders$ sam build
+python -m pip install boto3
+python scripts/smoke-test.py --stack-name aws-serverless-orders --region sa-east-1
 ```
 
-The SAM CLI installs dependencies defined in `hello-world/package.json`, compiles TypeScript with esbuild, creates a deployment package, and saves it in the `.aws-sam/build` folder.
+The smoke test creates one demo order, polls its status for up to 90 seconds, and exits unsuccessfully if processing does not finish. It uses the normal AWS credential chain, including `AWS_PROFILE` and temporary session credentials. It leaves the demo order in DynamoDB. Only run this command against the intended deployed stack; it is not part of CI and has not been run merely by installing the project.
 
-Test a single function by invoking it directly with a test event. An event is a JSON document that represents the input that the function receives from the event source. Test events are included in the `events` folder in this project.
+The `events/` directory includes API, DynamoDB stream, and SQS examples for `sam local invoke`. Local Lambda emulation does **not** automatically emulate DynamoDB/SQS or connect the event sources. Provide environment overrides with actual resource names and use the unit tests for an entirely offline check.
 
-Run functions locally and invoke them with the `sam local invoke` command.
+## Reliability boundaries
 
-```bash
-aws-serverless-orders$ sam local invoke HelloWorldFunction --event events/event.json
+- HTTP request retries are not deduplicated: each valid `POST` creates a new order. Add a client idempotency key before using the API for purchases.
+- Idempotency currently protects the database status transition. External payment or fulfillment services need their own idempotency and reconciliation strategy.
+- DynamoDB Streams retain events for 24 hours. Publishing retries are bounded; failures and expired streams require reconciliation from persisted `RECEIVED` orders. The publisher failure queue contains metadata, not replayable order payloads.
+- IAM controls API access for trusted callers. Customer-level authorization and tenant isolation are not implemented.
+- CloudWatch alarms have no notification actions until an operator configures them. There is no automatic deployment or claim of a production rollout.
+
+The [operations guide](docs/operations.md) covers monitoring, DLQ redrive, publishing recovery, migration, and cleanup.
+
+## Repository layout
+
+```text
+src/create-order/    HTTP validation and conditional persistence
+src/get-order/       Strongly consistent status lookup
+src/publish-order/   DynamoDB Streams → SQS
+src/process-order/   Idempotent SQS consumer
+src/shared/         AWS clients, validation and response helpers
+tests/              Unit tests with mocked AWS clients
+events/             Sample invocation payloads
+scripts/            Signed live-deployment smoke test
+docs/operations.md  Recovery and deployment notes
+template.yaml       AWS SAM infrastructure
+.github/workflows/  Continuous integration (no AWS credentials)
 ```
 
-The SAM CLI can also emulate your application's API. Use the `sam local start-api` to run the API locally on port 3000.
+## Design references
 
-```bash
-aws-serverless-orders$ sam local start-api
-aws-serverless-orders$ curl http://localhost:3000/
-```
-
-The SAM CLI reads the application template to determine the API's routes and the functions that they invoke. The `Events` property on each function's definition includes the route and method for each path.
-
-```yaml
-      Events:
-        HelloWorld:
-          Type: Api
-          Properties:
-            Path: /hello
-            Method: get
-```
-
-## Add a resource to your application
-The application template uses AWS Serverless Application Model (AWS SAM) to define application resources. AWS SAM is an extension of AWS CloudFormation with a simpler syntax for configuring common serverless application resources such as functions, triggers, and APIs. For resources not included in [the SAM specification](https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md), you can use standard [AWS CloudFormation](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-template-resource-type-ref.html) resource types.
-
-## Fetch, tail, and filter Lambda function logs
-
-To simplify troubleshooting, SAM CLI has a command called `sam logs`. `sam logs` lets you fetch logs generated by your deployed Lambda function from the command line. In addition to printing the logs on the terminal, this command has several nifty features to help you quickly find the bug.
-
-`NOTE`: This command works for all AWS Lambda functions; not just the ones you deploy using SAM.
-
-```bash
-aws-serverless-orders$ sam logs -n HelloWorldFunction --stack-name aws-serverless-orders --tail
-```
-
-You can find more information and examples about filtering Lambda function logs in the [SAM CLI Documentation](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-logging.html).
-
-## Unit tests
-
-Tests are defined in the `hello-world/tests` folder in this project. Use NPM to install the [Jest test framework](https://jestjs.io/) and run unit tests.
-
-```bash
-aws-serverless-orders$ cd hello-world
-hello-world$ npm install
-hello-world$ npm run test
-```
-
-## Cleanup
-
-To delete the sample application that you created, use the AWS CLI. Assuming you used your project name for the stack name, you can run the following:
-
-```bash
-sam delete --stack-name aws-serverless-orders
-```
-
-## Resources
-
-See the [AWS SAM developer guide](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/what-is-sam.html) for an introduction to SAM specification, the SAM CLI, and serverless application concepts.
-
-Next, you can use AWS Serverless Application Repository to deploy ready to use Apps that go beyond hello world samples and learn how authors developed their applications: [AWS Serverless Application Repository main page](https://aws.amazon.com/serverless/serverlessrepo/)
+- [AWS Lambda with SQS: visibility timeout and retries](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-configure.html)
+- [Partial batch responses for DynamoDB Streams](https://docs.aws.amazon.com/lambda/latest/dg/services-ddb-batchfailurereporting.html)
+- [DynamoDB stream failure destinations and retention limits](https://docs.aws.amazon.com/lambda/latest/dg/services-dynamodb-errors.html)
