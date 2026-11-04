@@ -11,6 +11,20 @@ Globals:
     Tracing: Active
     LoggingConfig:
       LogFormat: JSON
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME:
+          Ref: AWS::StackName
+        POWERTOOLS_LOG_LEVEL: INFO
+        POWERTOOLS_TRACER_CAPTURE_RESPONSE: 'false'
+        POWERTOOLS_TRACER_CAPTURE_ERROR: 'false'
+        ENVIRONMENT:
+          Ref: EnvironmentName
+    Tags:
+      Project:
+        Ref: AWS::StackName
+      Environment:
+        Ref: EnvironmentName
   Api:
     TracingEnabled: true
     Auth:
@@ -40,6 +54,8 @@ Globals:
       DEFAULT_5XX:
         ResponseTemplates:
           application/json: '{"code":"INTERNAL_ERROR","message":"Internal server error","requestId":"$context.requestId"}'
+    Name:
+      Fn::Sub: ${AWS::StackName}-api
 Resources:
   OrdersTable:
     Type: AWS::DynamoDB::Table
@@ -398,10 +414,17 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-OrdersDeadLetterAlarm
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
   PublishFailuresAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmDescription: Stream publishing failed. Inspect metadata and reconcile RECEIVED orders.
+      AlarmDescription: Stream retries exhausted. Inspect failure metadata and the durable outbox; see docs/operations.md.
       Namespace: AWS/SQS
       MetricName: ApproximateNumberOfMessagesVisible
       Dimensions:
@@ -416,6 +439,13 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-PublishFailuresAlarm
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
   OrderBacklogAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -434,6 +464,13 @@ Resources:
       Threshold: 300
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-OrderBacklogAlarm
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
   IdempotencyTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Retain
@@ -1020,6 +1057,636 @@ Resources:
             Condition:
               Bool:
                 aws:SecureTransport: 'false'
+  AlarmEncryptionKey:
+    Type: AWS::KMS::Key
+    Condition: HasAlarmEmail
+    Properties:
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: CloudWatchNotifications
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      KmsMasterKeyId:
+        Ref: AlarmEncryptionKey
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn:
+        Ref: AlarmTopic
+      Protocol: email
+      Endpoint:
+        Ref: AlarmEmail
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasAlarmEmail
+    Properties:
+      Topics:
+        - Ref: AlarmTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource:
+              Ref: AlarmTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*
+          - Effect: Deny
+            Principal: '*'
+            Action: sns:Publish
+            Resource:
+              Ref: AlarmTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  CreateOrderFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-CreateOrderFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: CreateOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  CreateOrderFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-CreateOrderFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: CreateOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  GetOrderFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-GetOrderFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: GetOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  GetOrderFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-GetOrderFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: GetOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  PublishOrderFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-PublishOrderFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: PublishOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  PublishOrderFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-PublishOrderFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: PublishOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  ProcessOrderFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-ProcessOrderFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: ProcessOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  ProcessOrderFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-ProcessOrderFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: ProcessOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  ReconcileOutboxFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-ReconcileOutboxFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: ReconcileOutboxFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  ReconcileOutboxFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-ReconcileOutboxFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: ReconcileOutboxFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotifyOrderFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotifyOrderFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: NotifyOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotifyOrderFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotifyOrderFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: NotifyOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  HealthFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-HealthFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: HealthFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  HealthFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-HealthFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: HealthFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  OrdersQueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-OrdersQueueBacklogAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - OrdersQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotificationsQueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotificationsQueueBacklogAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - NotificationsQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotificationsQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotificationsQueueAgeAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - NotificationsQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotificationDeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotificationDeadLetterQueueAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - NotificationDeadLetterQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  EventDeliveryDeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-EventDeliveryDeadLetterQueueAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - EventDeliveryDeadLetterQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotificationDeliveryDeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotificationDeliveryDeadLetterQueueAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - NotificationDeliveryDeadLetterQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  PublisherIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-PublisherIteratorAgeAlarm
+      Namespace: AWS/Lambda
+      MetricName: IteratorAge
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: PublishOrderFunction
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 60000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  OperationFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-OperationFailuresAlarm
+      Namespace: AWSOrders
+      MetricName: OperationFailures
+      Dimensions:
+        - Name: service
+          Value:
+            Ref: AWS::StackName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  ApiServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-ApiServerErrorsAlarm
+      AlarmDescription: API 5xx rate above 1%; includes errors returned normally by HTTP Lambda handlers.
+      Metrics:
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: 5XXError
+              Dimensions:
+                - Name: ApiName
+                  Value:
+                    Fn::Sub: ${AWS::StackName}-api
+                - Name: Stage
+                  Value: Prod
+            Period: 60
+            Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: Count
+              Dimensions:
+                - Name: ApiName
+                  Value:
+                    Fn::Sub: ${AWS::StackName}-api
+                - Name: Stage
+                  Value: Prod
+            Period: 60
+            Stat: Sum
+        - Id: rate
+          Expression: IF(requests > 0, 100 * errors / requests, 0)
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName:
+        Fn::Sub: ${AWS::StackName}-operations
+      DashboardBody:
+        Fn::Sub: '{"widgets":[{"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Lambda errors
+          and throttles","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWS/Lambda","Errors","FunctionName","${CreateOrderFunction}"],["AWS/Lambda","Throttles","FunctionName","${CreateOrderFunction}"],["AWS/Lambda","Errors","FunctionName","${GetOrderFunction}"],["AWS/Lambda","Throttles","FunctionName","${GetOrderFunction}"],["AWS/Lambda","Errors","FunctionName","${PublishOrderFunction}"],["AWS/Lambda","Throttles","FunctionName","${PublishOrderFunction}"],["AWS/Lambda","Errors","FunctionName","${ProcessOrderFunction}"],["AWS/Lambda","Throttles","FunctionName","${ProcessOrderFunction}"],["AWS/Lambda","Errors","FunctionName","${ReconcileOutboxFunction}"],["AWS/Lambda","Throttles","FunctionName","${ReconcileOutboxFunction}"],["AWS/Lambda","Errors","FunctionName","${NotifyOrderFunction}"],["AWS/Lambda","Throttles","FunctionName","${NotifyOrderFunction}"],["AWS/Lambda","Errors","FunctionName","${HealthFunction}"],["AWS/Lambda","Throttles","FunctionName","${HealthFunction}"]]}},{"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Order
+          and notification queue backlog","region":"${AWS::Region}","view":"timeSeries","stat":"Maximum","period":60,"metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${OrdersQueue.QueueName}"],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${NotificationsQueue.QueueName}"],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${OrdersDeadLetterQueue.QueueName}"],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${NotificationDeadLetterQueue.QueueName}"]]}},{"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"API
+          requests and 5xx","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWS/ApiGateway","Count","ApiName","${AWS::StackName}-api","Stage","Prod"],["AWS/ApiGateway","5XXError","ApiName","${AWS::StackName}-api","Stage","Prod"]]}},{"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Application
+          failures and request volume","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWSOrders","OperationFailures","service","${AWS::StackName}"],["AWSOrders","HttpRequests","service","${AWS::StackName}"],["AWSOrders","HttpServerErrors","service","${AWS::StackName}"]]}}]}'
 Outputs:
   OrdersApi:
     Description: Cognito-authorized POST /orders endpoint
@@ -1119,6 +1786,10 @@ Outputs:
     Description: Configured callback URL
     Value:
       Ref: OAuthCallbackUrl
+  DashboardUrl:
+    Description: CloudWatch operations dashboard
+    Value:
+      Fn::Sub: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-operations
 Parameters:
   TestNotificationEmail:
     Type: String
@@ -1129,9 +1800,25 @@ Parameters:
     Default: http://localhost:8765/callback
     AllowedPattern: ^(https://[^ ]+|http://localhost:[0-9]+/callback)$
     Description: Explicit OAuth callback; localhost HTTP is for the local PKCE demo only.
+  EnvironmentName:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - production
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional explicitly approved operational alert recipient; enables an encrypted SNS topic and a
+      KMS key.
 Conditions:
   HasTestEmail:
     Fn::Not:
       - Fn::Equals:
           - Ref: TestNotificationEmail
+          - ''
+  HasAlarmEmail:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: AlarmEmail
           - ''

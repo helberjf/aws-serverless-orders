@@ -1,3 +1,4 @@
+import { count, instrument, logger } from './telemetry';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 
 export class HttpError extends Error {
@@ -17,13 +18,14 @@ export function jsonResponse(statusCode: number, body: unknown): APIGatewayProxy
     };
 }
 export function logError(eventType: string, error: unknown, context: Record<string, unknown>): void {
-    console.error({ eventType, ...context, errorType: error instanceof Error ? error.name : 'UnknownError' });
+    count('OperationFailures');
+    logger.error(eventType, { eventType, ...context, errorType: error instanceof Error ? error.name : 'UnknownError' });
 }
 export function apiHandler(
     operation: string,
     handler: (event: APIGatewayProxyEvent) => Promise<APIGatewayProxyResult>,
 ) {
-    return async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+    return instrument(operation, async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
         const requestId = event.requestContext?.requestId ?? 'unknown';
         let response: APIGatewayProxyResult;
         try {
@@ -36,8 +38,17 @@ export function apiHandler(
                 response = jsonResponse(500, { code: 'INTERNAL_ERROR', message: 'Internal server error', requestId });
             }
         }
+        count('HttpRequests');
+        if (response.statusCode >= 500) count('HttpServerErrors');
+        logger.info('http_request_completed', {
+            eventType: 'http_request_completed',
+            operation,
+            requestId,
+            status: response.statusCode,
+            orderId: event.pathParameters?.orderId,
+        });
         return { ...response, headers: { ...response.headers, 'X-Request-Id': requestId } };
-    };
+    });
 }
 export function parseBody(event: APIGatewayProxyEvent): unknown {
     if (!event.body) throw new HttpError(400, 'INVALID_REQUEST', 'Request body is required');

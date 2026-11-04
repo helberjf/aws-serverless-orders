@@ -1,3 +1,4 @@
+import { logger } from '../src/shared/telemetry';
 import type { APIGatewayProxyEvent, DynamoDBRecord, DynamoDBStreamEvent, SQSEvent } from 'aws-lambda';
 import type { MockInstance } from 'vitest';
 import { documentClient, eventBridgeClient, snsClient, sqsClient } from '../src/shared/clients';
@@ -23,6 +24,8 @@ export function mockClients() {
     sqs.mockResolvedValue({ MessageId: 'sent' });
     events.mockResolvedValue({ FailedEntryCount: 0, Entries: [{ EventId: 'accepted' }] });
     sns.mockResolvedValue({ MessageId: 'notification' });
+    vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    vi.spyOn(logger, 'error').mockImplementation(() => undefined);
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
     vi.spyOn(console, 'info').mockImplementation(() => undefined);
     return { dynamo, sqs, events, sns };

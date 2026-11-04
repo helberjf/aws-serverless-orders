@@ -1,3 +1,5 @@
+import { instrument } from '../shared/telemetry';
+import { logInfo } from '../shared/telemetry';
 import type { SQSEvent, SQSBatchResponse } from 'aws-lambda';
 import { GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { z } from 'zod';
@@ -66,10 +68,10 @@ async function queueNotification(body: string): Promise<void> {
         if (Item?.requestHash === requestHash) return;
         throw error;
     }
-    console.info({ eventType: 'order_notification_queued', eventId, orderId: detail.orderId });
+    logInfo({ eventType: 'order_notification_queued', eventId, orderId: detail.orderId });
 }
 
-export const lambdaHandler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
+export const lambdaHandler = instrument('notify-order', async (event: SQSEvent): Promise<SQSBatchResponse> => {
     const batchItemFailures: SQSBatchResponse['batchItemFailures'] = [];
     for (const record of event.Records) {
         try {
@@ -80,4 +82,4 @@ export const lambdaHandler = async (event: SQSEvent): Promise<SQSBatchResponse> 
         }
     }
     return { batchItemFailures };
-};
+});

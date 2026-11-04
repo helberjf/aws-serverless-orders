@@ -17,17 +17,17 @@ describe('scheduled reconciliation', () => {
                 return { Item: outboxItem('OrderCreated', orderId, {}, new Date(Date.now() - 1000).toISOString()) };
             return {};
         });
-        expect(await lambdaHandler()).toEqual({ attempted: 2, failed: 0 });
+        expect(await lambdaHandler({})).toEqual({ attempted: 2, failed: 0 });
         expect(clients.dynamo.mock.calls[0][0].input.IndexName).toBe('PendingByNextAttempt');
         expect(clients.sqs).toHaveBeenCalledTimes(2);
     });
     it('continues after one failed pending record', async () => {
         const clients = mockClients();
         clients.dynamo.mockResolvedValueOnce({ Items: [{ eventId: 'missing' }] }).mockResolvedValue({});
-        expect(await lambdaHandler()).toEqual({ attempted: 1, failed: 1 });
+        expect(await lambdaHandler({})).toEqual({ attempted: 1, failed: 1 });
     });
     it('accepts an empty result', async () => {
         mockClients();
-        expect(await lambdaHandler()).toEqual({ attempted: 0, failed: 0 });
+        expect(await lambdaHandler({})).toEqual({ attempted: 0, failed: 0 });
     });
 });

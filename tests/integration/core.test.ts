@@ -1,3 +1,4 @@
+import { logger } from '../../src/shared/telemetry';
 import { randomUUID } from 'node:crypto';
 import { SendMessageCommand } from '@aws-sdk/client-sqs';
 import { PutEventsCommand } from '@aws-sdk/client-eventbridge';
@@ -51,6 +52,8 @@ afterAll(async () => {
     documentClient.destroy();
 });
 beforeEach(() => {
+    vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    vi.spyOn(logger, 'error').mockImplementation(() => undefined);
     vi.spyOn(console, 'info').mockImplementation(() => undefined);
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
 });

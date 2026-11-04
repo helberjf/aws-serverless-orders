@@ -1,3 +1,5 @@
+import { instrument } from '../shared/telemetry';
+import { logInfo } from '../shared/telemetry';
 import type { SQSBatchResponse, SQSEvent } from 'aws-lambda';
 import { GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { documentClient, requiredEnv } from '../shared/clients';
@@ -70,16 +72,16 @@ export async function processOrder(orderId: string): Promise<void> {
         if (latest.Item?.status === 'PROCESSED') return;
         throw error;
     }
-    console.info({ eventType: 'order_processed', orderId, status: 'PROCESSED', fulfillmentId });
+    logInfo({ eventType: 'order_processed', orderId, status: 'PROCESSED', fulfillmentId });
 }
-export const lambdaHandler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
+export const lambdaHandler = instrument('process-order', async (event: SQSEvent): Promise<SQSBatchResponse> => {
     const batchItemFailures: SQSBatchResponse['batchItemFailures'] = [];
     for (const record of event.Records) {
         const started = Date.now();
         try {
             const body = processingMessageSchema.parse(JSON.parse(record.body));
             await processOrder(body.orderId);
-            console.info({
+            logInfo({
                 eventType: 'order_message_handled',
                 orderId: body.orderId,
                 messageId: record.messageId,
@@ -91,4 +93,4 @@ export const lambdaHandler = async (event: SQSEvent): Promise<SQSBatchResponse> 
         }
     }
     return { batchItemFailures };
-};
+});

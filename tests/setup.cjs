@@ -13,3 +13,6 @@ process.env.NOTIFICATIONS_TOPIC_ARN = 'arn:aws:sns:sa-east-1:123456789012:test-o
 
 process.env.COGNITO_CLIENT_ID = 'test-client';
 process.env.COGNITO_ISSUER = 'https://cognito-idp.sa-east-1.amazonaws.com/sa-east-1_test';
+
+process.env.POWERTOOLS_TRACE_ENABLED = 'false';
+process.env.POWERTOOLS_METRICS_DISABLED = 'true';

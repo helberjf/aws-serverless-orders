@@ -1,3 +1,4 @@
+import { logInfo } from './telemetry';
 import { randomUUID } from 'node:crypto';
 import { GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { SendMessageCommand } from '@aws-sdk/client-sqs';
@@ -120,7 +121,7 @@ export async function dispatchOutbox(eventId: string): Promise<void> {
                 },
             }),
         );
-        console.info({ eventType: 'outbox_delivered', orderId: record.orderId, eventId, status: 'PUBLISHED' });
+        logInfo({ eventType: 'outbox_delivered', orderId: record.orderId, eventId, status: 'PUBLISHED' });
     } catch (error) {
         // A publish can succeed before this update fails. Retrying is deliberate at-least-once delivery.
         try {

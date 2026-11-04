@@ -1,3 +1,4 @@
+import { logInfo } from '../shared/telemetry';
 import { randomUUID } from 'node:crypto';
 import { TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { documentClient, requiredEnv } from '../shared/clients';
@@ -86,7 +87,7 @@ export const lambdaHandler = apiHandler('create_order', async (event) => {
         if (replay) return respond(replay, true);
         throw error;
     }
-    console.info({
+    logInfo({
         eventType: 'order_created',
         orderId: order.orderId,
         requestId: event.requestContext.requestId,
