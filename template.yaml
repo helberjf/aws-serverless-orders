@@ -1,13 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Event-driven order processing with DynamoDB Streams, SQS and idempotent Lambda consumers.
-
 Globals:
   Function:
     Timeout: 10
     MemorySize: 256
     Runtime: nodejs24.x
-    Architectures: [x86_64]
+    Architectures:
+      - x86_64
     Tracing: Active
     LoggingConfig:
       LogFormat: JSON
@@ -15,7 +15,6 @@ Globals:
     TracingEnabled: true
     Auth:
       DefaultAuthorizer: AWS_IAM
-
 Resources:
   OrdersTable:
     Type: AWS::DynamoDB::Table
@@ -33,44 +32,60 @@ Resources:
         StreamViewType: KEYS_ONLY
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
-
   OrdersDeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
-
   PublishFailuresQueue:
     Type: AWS::SQS::Queue
     Properties:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
-
   OrdersQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 180
+      VisibilityTimeout: 181
       MessageRetentionPeriod: 345600
       SqsManagedSseEnabled: true
       RedrivePolicy:
-        deadLetterTargetArn: !GetAtt OrdersDeadLetterQueue.Arn
+        deadLetterTargetArn:
+          Fn::GetAtt:
+            - OrdersDeadLetterQueue
+            - Arn
         maxReceiveCount: 5
-
   CreateOrderFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: .
       Handler: src/create-order/app.lambdaHandler
       LoggingConfig:
-        LogGroup: !Ref CreateOrderLogGroup
+        LogGroup:
+          Ref: CreateOrderLogGroup
       Environment:
         Variables:
-          ORDERS_TABLE: !Ref OrdersTable
+          ORDERS_TABLE:
+            Ref: OrdersTable
+          OUTBOX_TABLE:
+            Ref: OutboxTable
+          IDEMPOTENCY_TABLE:
+            Ref: IdempotencyTable
       Policies:
         - Statement:
             - Effect: Allow
-              Action: dynamodb:PutItem
-              Resource: !GetAtt OrdersTable.Arn
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+              Resource:
+                - Fn::GetAtt:
+                    - OrdersTable
+                    - Arn
+                - Fn::GetAtt:
+                    - IdempotencyTable
+                    - Arn
+                - Fn::GetAtt:
+                    - OutboxTable
+                    - Arn
       Events:
         CreateOrderApi:
           Type: Api
@@ -83,23 +98,28 @@ Resources:
         Minify: true
         Target: es2022
         Sourcemap: false
-        EntryPoints: [src/create-order/app.ts]
-
+        EntryPoints:
+          - src/create-order/app.ts
   GetOrderFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: .
       Handler: src/get-order/app.lambdaHandler
       LoggingConfig:
-        LogGroup: !Ref GetOrderLogGroup
+        LogGroup:
+          Ref: GetOrderLogGroup
       Environment:
         Variables:
-          ORDERS_TABLE: !Ref OrdersTable
+          ORDERS_TABLE:
+            Ref: OrdersTable
       Policies:
         - Statement:
             - Effect: Allow
               Action: dynamodb:GetItem
-              Resource: !GetAtt OrdersTable.Arn
+              Resource:
+                Fn::GetAtt:
+                  - OrdersTable
+                  - Arn
       Events:
         GetOrderApi:
           Type: Api
@@ -112,24 +132,47 @@ Resources:
         Minify: true
         Target: es2022
         Sourcemap: false
-        EntryPoints: [src/get-order/app.ts]
-
+        EntryPoints:
+          - src/get-order/app.ts
   PublishOrderFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: .
       Handler: src/publish-order/app.lambdaHandler
       LoggingConfig:
-        LogGroup: !Ref PublishOrderLogGroup
+        LogGroup:
+          Ref: PublishOrderLogGroup
       Timeout: 30
       Environment:
         Variables:
-          ORDERS_QUEUE_URL: !Ref OrdersQueue
+          ORDERS_QUEUE_URL:
+            Ref: OrdersQueue
+          OUTBOX_TABLE:
+            Ref: OutboxTable
+          ORDERS_EVENT_BUS:
+            Ref: OrdersEventBus
+          NOTIFICATIONS_TOPIC_ARN:
+            Ref: NotificationsTopic
       Policies:
         - SQSSendMessagePolicy:
-            QueueName: !GetAtt OrdersQueue.QueueName
+            QueueName:
+              Fn::GetAtt:
+                - OrdersQueue
+                - QueueName
         - SQSSendMessagePolicy:
-            QueueName: !GetAtt PublishFailuresQueue.QueueName
+            QueueName:
+              Fn::GetAtt:
+                - PublishFailuresQueue
+                - QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource:
+                Fn::GetAtt:
+                  - OutboxTable
+                  - Arn
         - Statement:
             - Effect: Allow
               Action:
@@ -137,89 +180,153 @@ Resources:
                 - dynamodb:GetRecords
                 - dynamodb:GetShardIterator
                 - dynamodb:ListStreams
-              Resource: !GetAtt OrdersTable.StreamArn
+              Resource:
+                Fn::GetAtt:
+                  - OutboxTable
+                  - StreamArn
+        - Statement:
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource:
+                Fn::GetAtt:
+                  - OrdersEventBus
+                  - Arn
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource:
+                Ref: NotificationsTopic
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:GenerateDataKey
+                - kms:Decrypt
+              Resource:
+                Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
+              Condition:
+                StringEquals:
+                  kms:ViaService:
+                    Fn::Sub: sns.${AWS::Region}.${AWS::URLSuffix}
+                ForAnyValue:StringEquals:
+                  kms:ResourceAliases: alias/aws/sns
       Events:
         OrderInserted:
           Type: DynamoDB
           Properties:
-            Stream: !GetAtt OrdersTable.StreamArn
+            Stream:
+              Fn::GetAtt:
+                - OutboxTable
+                - StreamArn
             StartingPosition: TRIM_HORIZON
-            BatchSize: 10
+            BatchSize: 5
             MaximumRetryAttempts: 10
             MaximumRecordAgeInSeconds: 3600
             BisectBatchOnFunctionError: true
-            FunctionResponseTypes: [ReportBatchItemFailures]
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
             FilterCriteria:
               Filters:
                 - Pattern: '{"eventName":["INSERT"]}'
             DestinationConfig:
               OnFailure:
                 Type: SQS
-                Destination: !GetAtt PublishFailuresQueue.Arn
+                Destination:
+                  Fn::GetAtt:
+                    - PublishFailuresQueue
+                    - Arn
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
         Minify: true
         Target: es2022
         Sourcemap: false
-        EntryPoints: [src/publish-order/app.ts]
-
+        EntryPoints:
+          - src/publish-order/app.ts
   ProcessOrderFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: .
       Handler: src/process-order/app.lambdaHandler
       LoggingConfig:
-        LogGroup: !Ref ProcessOrderLogGroup
+        LogGroup:
+          Ref: ProcessOrderLogGroup
       Timeout: 30
       Environment:
         Variables:
-          ORDERS_TABLE: !Ref OrdersTable
+          ORDERS_TABLE:
+            Ref: OrdersTable
+          OUTBOX_TABLE:
+            Ref: OutboxTable
+          FULFILLMENTS_TABLE:
+            Ref: FulfillmentsTable
       Policies:
         - SQSPollerPolicy:
-            QueueName: !GetAtt OrdersQueue.QueueName
+            QueueName:
+              Fn::GetAtt:
+                - OrdersQueue
+                - QueueName
         - Statement:
             - Effect: Allow
-              Action: [dynamodb:UpdateItem, dynamodb:GetItem]
-              Resource: !GetAtt OrdersTable.Arn
+              Action:
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+              Resource:
+                - Fn::GetAtt:
+                    - OrdersTable
+                    - Arn
+                - Fn::GetAtt:
+                    - FulfillmentsTable
+                    - Arn
+                - Fn::GetAtt:
+                    - OutboxTable
+                    - Arn
       Events:
         Orders:
           Type: SQS
           Properties:
-            Queue: !GetAtt OrdersQueue.Arn
+            Queue:
+              Fn::GetAtt:
+                - OrdersQueue
+                - Arn
             BatchSize: 10
-            FunctionResponseTypes: [ReportBatchItemFailures]
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
             ScalingConfig:
               MaximumConcurrency: 5
+            MaximumBatchingWindowInSeconds: 1
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
         Minify: true
         Target: es2022
         Sourcemap: false
-        EntryPoints: [src/process-order/app.ts]
-
+        EntryPoints:
+          - src/process-order/app.ts
   CreateOrderLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/create-order
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/create-order
       RetentionInDays: 14
   GetOrderLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/get-order
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/get-order
       RetentionInDays: 14
   PublishOrderLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/publish-order
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/publish-order
       RetentionInDays: 14
   ProcessOrderLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/process-order
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/process-order
       RetentionInDays: 14
-
   OrdersDeadLetterAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -228,7 +335,10 @@ Resources:
       MetricName: ApproximateNumberOfMessagesVisible
       Dimensions:
         - Name: QueueName
-          Value: !GetAtt OrdersDeadLetterQueue.QueueName
+          Value:
+            Fn::GetAtt:
+              - OrdersDeadLetterQueue
+              - QueueName
       Statistic: Maximum
       Period: 60
       EvaluationPeriods: 1
@@ -243,7 +353,10 @@ Resources:
       MetricName: ApproximateNumberOfMessagesVisible
       Dimensions:
         - Name: QueueName
-          Value: !GetAtt PublishFailuresQueue.QueueName
+          Value:
+            Fn::GetAtt:
+              - PublishFailuresQueue
+              - QueueName
       Statistic: Maximum
       Period: 60
       EvaluationPeriods: 1
@@ -258,39 +371,243 @@ Resources:
       MetricName: ApproximateAgeOfOldestMessage
       Dimensions:
         - Name: QueueName
-          Value: !GetAtt OrdersQueue.QueueName
+          Value:
+            Fn::GetAtt:
+              - OrdersQueue
+              - QueueName
       Statistic: Maximum
       Period: 60
       EvaluationPeriods: 2
       Threshold: 300
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: idempotencyKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotencyKey
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+  FulfillmentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  OutboxTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: deliveryStatus
+          AttributeType: S
+        - AttributeName: nextAttemptAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: KEYS_ONLY
+      GlobalSecondaryIndexes:
+        - IndexName: PendingByNextAttempt
+          KeySchema:
+            - AttributeName: deliveryStatus
+              KeyType: HASH
+            - AttributeName: nextAttemptAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+  OrdersEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name:
+        Fn::Sub: ${AWS::StackName}-orders
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+  ReconcileOutboxFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/reconcile-outbox/app.lambdaHandler
+      LoggingConfig:
+        LogGroup:
+          Ref: ReconcileOutboxLogGroup
+      Timeout: 90
+      Environment:
+        Variables:
+          ORDERS_QUEUE_URL:
+            Ref: OrdersQueue
+          OUTBOX_TABLE:
+            Ref: OutboxTable
+          ORDERS_EVENT_BUS:
+            Ref: OrdersEventBus
+          NOTIFICATIONS_TOPIC_ARN:
+            Ref: NotificationsTopic
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName:
+              Fn::GetAtt:
+                - OrdersQueue
+                - QueueName
+        - SQSSendMessagePolicy:
+            QueueName:
+              Fn::GetAtt:
+                - PublishFailuresQueue
+                - QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource:
+                Fn::GetAtt:
+                  - OutboxTable
+                  - Arn
+        - Statement:
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource:
+                Fn::GetAtt:
+                  - OrdersEventBus
+                  - Arn
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource:
+                Ref: NotificationsTopic
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:GenerateDataKey
+                - kms:Decrypt
+              Resource:
+                Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
+              Condition:
+                StringEquals:
+                  kms:ViaService:
+                    Fn::Sub: sns.${AWS::Region}.${AWS::URLSuffix}
+                ForAnyValue:StringEquals:
+                  kms:ResourceAliases: alias/aws/sns
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                Fn::Sub: ${OutboxTable.Arn}/index/PendingByNextAttempt
+      Events:
+        ReconcileSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Enabled: true
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        EntryPoints:
+          - src/reconcile-outbox/app.ts
+  ReconcileOutboxLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/reconcile-outbox
+      RetentionInDays: 14
 Outputs:
   OrdersApi:
     Description: IAM-authorized API endpoint for POST orders and GET orders/{orderId}
-    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/orders
+    Value:
+      Fn::Sub: https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/orders
   OrdersTableName:
     Description: DynamoDB Orders table
-    Value: !Ref OrdersTable
+    Value:
+      Ref: OrdersTable
   CreateOrderFunctionArn:
     Description: Create Order Lambda ARN
-    Value: !GetAtt CreateOrderFunction.Arn
+    Value:
+      Fn::GetAtt:
+        - CreateOrderFunction
+        - Arn
   OrdersQueueUrl:
     Description: SQS Orders Queue URL
-    Value: !Ref OrdersQueue
+    Value:
+      Ref: OrdersQueue
   OrdersQueueArn:
     Description: SQS Orders Queue ARN
-    Value: !GetAtt OrdersQueue.Arn
+    Value:
+      Fn::GetAtt:
+        - OrdersQueue
+        - Arn
   OrdersDeadLetterQueueUrl:
     Description: Failed processing messages (safe to redrive after fixing the cause)
-    Value: !Ref OrdersDeadLetterQueue
+    Value:
+      Ref: OrdersDeadLetterQueue
   OrdersDeadLetterQueueArn:
     Description: Failed processing queue ARN for redrive
-    Value: !GetAtt OrdersDeadLetterQueue.Arn
+    Value:
+      Fn::GetAtt:
+        - OrdersDeadLetterQueue
+        - Arn
   PublishFailuresQueueUrl:
     Description: Stream failure metadata (not directly replayable order messages)
-    Value: !Ref PublishFailuresQueue
+    Value:
+      Ref: PublishFailuresQueue
   ApiInvokeArn:
     Description: Resource ARN for callers with execute-api:Invoke permission
-    Value: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ServerlessRestApi}/Prod/*/orders*
+    Value:
+      Fn::Sub: arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ServerlessRestApi}/Prod/*/orders*
+  OutboxTable:
+    Description: OutboxTable
+    Value:
+      Ref: OutboxTable
+  IdempotencyTable:
+    Description: IdempotencyTable
+    Value:
+      Ref: IdempotencyTable
+  FulfillmentsTable:
+    Description: FulfillmentsTable
+    Value:
+      Ref: FulfillmentsTable
+  OrdersEventBus:
+    Description: OrdersEventBus
+    Value:
+      Ref: OrdersEventBus
+  NotificationsTopic:
+    Description: NotificationsTopic
+    Value:
+      Ref: NotificationsTopic
