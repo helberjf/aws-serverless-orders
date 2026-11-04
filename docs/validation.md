@@ -51,7 +51,7 @@ SQS, EventBridge and SNS calls are mocked in this local integration suite. Dynam
 
 No AWS profile or credentials were available in this workspace. No development/production stack, Cognito pool, queue, subscription, OIDC role or KMS key was created. No email was sent and no AWS cleanup was performed.
 
-GitHub Actions had previously rejected a repository CI run before any steps started with: **“The job was not started because your account is locked due to a billing issue.”** The workflow source now passes local Actionlint and the CI-equivalent checks above, but that does not establish a successful hosted runner execution. Billing/account resolution requires the account owner. No bypass or billing change was attempted.
+The [PR #4 CI run](https://github.com/helberjf/aws-serverless-orders/actions/runs/41777765747), for revision `20f1ab3`, was rejected before any steps started with: **“The job was not started because your account is locked due to a billing issue.”** This confirms the account restriction also affects the new workflow. The workflow source passes local Actionlint and the CI-equivalent checks above, but that does not establish a successful hosted runner execution. Billing/account resolution requires the account owner. No bypass or billing change was attempted. The separate GitGuardian check passed for that revision; CodeRabbit skipped its review of the draft PR.
 
 No GitHub environments were present when inspected. The bootstrap template and production preflight are prepared, but OIDC trust, production reviewers and live deployment remain unconfigured until the documented setup is authorized and executed.
 
