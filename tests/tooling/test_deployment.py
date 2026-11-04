@@ -147,6 +147,61 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(len(reviewed["changes"]), 2)
         cf.execute_change_set.assert_not_called()
 
+    def test_plan_rejects_an_existing_stack_from_another_environment(self):
+        for existing, requested in (
+            ("production", "development"),
+            ("development", "production"),
+        ):
+            with self.subTest(existing=existing, requested=requested):
+                cf, s3 = Mock(), Mock()
+                cf.describe_stacks.return_value = {
+                    "Stacks": [
+                        {
+                            "StackStatus": "UPDATE_COMPLETE",
+                            "Parameters": [
+                                {
+                                    "ParameterKey": "EnvironmentName",
+                                    "ParameterValue": existing,
+                                }
+                            ],
+                        }
+                    ]
+                }
+                cf.create_change_set.return_value = {
+                    "Id": "change-1",
+                    "StackId": "stack-1",
+                }
+                cf.describe_change_set.return_value = {**self.change, "Changes": []}
+                s3.put_object.return_value = {"VersionId": "version-1"}
+                s3.meta.endpoint_url = "https://s3.sa-east-1.amazonaws.com"
+                session = Mock()
+                session.client.side_effect = lambda service: {
+                    "cloudformation": cf,
+                    "s3": s3,
+                }[service]
+                with TemporaryDirectory() as directory:
+                    template = Path(directory) / "template.yaml"
+                    template.write_text(
+                        "Parameters:\n  EnvironmentName: {Type: String}\nResources: {}\n"
+                    )
+                    args = SimpleNamespace(
+                        stack_name="orders-existing",
+                        environment=requested,
+                        template=str(template),
+                        review_file=str(Path(directory) / "review.json"),
+                        parameters_file=None,
+                        artifact_bucket="test-bucket",
+                        revision="abc123",
+                        execution_role="test-role",
+                    )
+                    with patch("sys.stdout", new=io.StringIO()), self.assertRaisesRegex(
+                        ValueError, "existing stack belongs to"
+                    ):
+                        deployment.plan(args, session)
+                session.client.assert_called_once_with("cloudformation")
+                s3.put_object.assert_not_called()
+                cf.create_change_set.assert_not_called()
+
     def test_apply_executes_only_reviewed_id_and_waits(self):
         cf = Mock()
         cf.describe_change_set.return_value = self.change

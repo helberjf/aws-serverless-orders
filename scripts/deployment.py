@@ -60,6 +60,15 @@ def validate_review(review, change, stack_name, environment, revision):
 def plan(args, session):
     cf = session.client("cloudformation")
     stack = existing_stack(cf, args.stack_name)
+    existing_parameters = {
+        parameter["ParameterKey"]: parameter.get("ParameterValue")
+        for parameter in (stack or {}).get("Parameters", [])
+    }
+    existing_environment = existing_parameters.get("EnvironmentName")
+    if existing_environment is not None and existing_environment != args.environment:
+        raise ValueError(
+            f"The existing stack belongs to {existing_environment}; use a separate stack for {args.environment}"
+        )
     if stack and stack["StackStatus"] not in (
         "CREATE_COMPLETE",
         "UPDATE_COMPLETE",
@@ -90,9 +99,7 @@ def plan(args, session):
     unknown = set(supplied) - set(template.get("Parameters", {}))
     if unknown:
         raise ValueError(f"Unknown template parameters: {sorted(unknown)}")
-    previous = (
-        {p["ParameterKey"] for p in stack.get("Parameters", [])} if stack else set()
-    )
+    previous = set(existing_parameters)
     parameters = [{"ParameterKey": k, "ParameterValue": v} for k, v in supplied.items()]
     parameters.extend(
         {"ParameterKey": k, "UsePreviousValue": True}

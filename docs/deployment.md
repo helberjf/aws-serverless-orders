@@ -71,6 +71,8 @@ Create four environments in repository settings: `development-plan`, `developmen
 
 Use matching `STACK_NAME` and `AWS_REGION` values in each plan/apply pair. Role ARNs and the bucket name come from bootstrap outputs. These identifiers are configuration variables, not AWS secrets. No `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` secret is needed.
 
+The planner rejects an existing stack whose `EnvironmentName` differs from the requested environment, before uploading a template or creating a Change Set. A development/production mismatch must be resolved by selecting the correct stack and credentials; the tool never converts one environment into the other. Legacy stacks without that parameter can still use the reviewed migration procedure below.
+
 Production's workflow checks the real environment configuration before planning and again before applying. Missing protection, a non-main ref, extra branch/tag rules, missing reviewers or enabled bypass cause failure. GitHub must support required reviewers for the repository's plan/visibility; if it does not, do not enable production deployment. Where a second reviewer is available, also enable prevention of self-review. [GitHub environment protection documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
 
 Protect `main` with required PR review and the CI check when GitHub Actions is available. Repository administrators remain privileged and can edit these settings, so environment protection is not a substitute for repository governance.
