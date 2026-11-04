@@ -9,7 +9,7 @@ import { lambdaHandler as create } from '../../src/create-order/app';
 import { lambdaHandler as get } from '../../src/get-order/app';
 import { lambdaHandler as process } from '../../src/process-order/app';
 import { lambdaHandler as notify } from '../../src/notify-order/app';
-import { dispatchOutbox } from '../../src/shared/outbox';
+import { dispatchOutbox, OutboxBusyError } from '../../src/shared/outbox';
 import { apiEvent, input, sqsEvent } from '../support';
 
 const endpoint = processEnvEndpoint();
@@ -72,6 +72,32 @@ async function row(env: string, Key: Record<string, string>) {
 }
 
 describe('DynamoDB Local transactions across real handlers', () => {
+    it('honors a retry delay changed by another publisher after reading an intent', async () => {
+        const order = JSON.parse((await create(request())).body);
+        const eventId = `OrderCreated:${order.orderId}`;
+        const retryAt = new Date(Date.now() + 60000).toISOString();
+        const send = documentClient.send.bind(documentClient);
+        const transport = vi.spyOn(sqsClient, 'send').mockResolvedValue({ MessageId: 'unexpected' } as never);
+        // Another worker releases its failed attempt while this worker holds an older read.
+        vi.spyOn(documentClient, 'send').mockImplementationOnce(async (command) => {
+            const result = await send(command);
+            await send(
+                new UpdateCommand({
+                    TableName: globalThis.process.env.OUTBOX_TABLE,
+                    Key: { eventId },
+                    UpdateExpression: 'SET nextAttemptAt = :next',
+                    ExpressionAttributeValues: { ':next': retryAt },
+                }),
+            );
+            return result;
+        });
+        await expect(dispatchOutbox(eventId)).rejects.toBeInstanceOf(OutboxBusyError);
+        expect(transport).not.toHaveBeenCalled();
+        expect(await row('OUTBOX_TABLE', { eventId })).toMatchObject({
+            deliveryStatus: 'PENDING',
+            nextAttemptAt: retryAt,
+        });
+    });
     it('creates, publishes, prepares fulfillment and returns the updated status', async () => {
         const result = await create(request());
         expect(result.statusCode).toBe(201);
@@ -113,9 +139,11 @@ describe('DynamoDB Local transactions across real handlers', () => {
     });
     it('deduplicates simultaneous HTTP requests with the same owner and key', async () => {
         const event = request();
-        const results = await Promise.all(Array.from({ length: 8 }, () => create(event)));
-        expect(results.every((r) => [201, 409].includes(r.statusCode))).toBe(true);
-        const orders = results.filter((r) => r.statusCode === 201).map((r) => JSON.parse(r.body).orderId);
+        const concurrent = await Promise.all(Array.from({ length: 8 }, () => create(event)));
+        // An in-flight transaction conflict may return a retryable 500, but an identical payload is never 409.
+        const results = await Promise.all(concurrent.map((r) => (r.statusCode === 500 ? create(event) : r)));
+        expect(results.every((r) => r.statusCode === 201)).toBe(true);
+        const orders = results.map((r) => JSON.parse(r.body).orderId);
         expect(new Set(orders).size).toBe(1);
         expect(JSON.parse((await create(event)).body).orderId).toBe(orders[0]);
     });

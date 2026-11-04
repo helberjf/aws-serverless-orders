@@ -2,7 +2,7 @@
 
 ## ADR 001 — Durable transactional outbox
 
-An order and its `OrderCreated` intent are written with the idempotency response in one DynamoDB transaction. Processing atomically updates the order, creates one fulfillment ticket, and records `OrderProcessed`. Publishing is a separate, retryable operation. The outbox stream is the low-latency trigger; a scheduled query of `PendingByNextAttempt` recovers committed work even after stream records expire.
+An order and its `OrderCreated` intent are written with the idempotency response in one DynamoDB transaction. Processing atomically updates the order, creates one fulfillment ticket, and records `OrderProcessed`. Publishing is a separate, retryable operation. The outbox stream is the low-latency trigger; a scheduled query of `PendingByNextAttempt` recovers committed work even after stream records expire. Lease acquisition checks the retry deadline atomically, so a worker with an older read cannot bypass another publisher's newly scheduled backoff.
 
 Publishers take a conditional 120-second lease. Failed attempts receive exponential backoff, capped at one hour, so a poison record cannot permanently occupy the front of the recovery query. Pending records never receive a TTL. Only delivered outbox records expire after seven days. External publication followed by recording success cannot be made atomic: an ambiguous response or a crash can cause another delivery. Stable business event IDs and idempotent consumers are required throughout.
 

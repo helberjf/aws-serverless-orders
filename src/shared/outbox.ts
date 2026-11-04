@@ -42,8 +42,9 @@ export async function dispatchOutbox(eventId: string): Promise<void> {
     if (!Item) throw new Error('Outbox record is missing');
     const record = outboxSchema.parse(Item);
     if (record.deliveryStatus === 'PUBLISHED') return;
-    const now = Math.floor(Date.now() / 1000);
-    if (Date.parse(record.nextAttemptAt) > Date.now()) throw new OutboxBusyError();
+    const attemptedAt = Date.now();
+    const now = Math.floor(attemptedAt / 1000);
+    if (Date.parse(record.nextAttemptAt) > attemptedAt) throw new OutboxBusyError();
     const leaseOwner = randomUUID();
     try {
         await documentClient.send(
@@ -53,12 +54,13 @@ export async function dispatchOutbox(eventId: string): Promise<void> {
                 UpdateExpression:
                     'SET leaseOwner = :owner, leaseUntil = :until, nextAttemptAt = :next ADD attempts :one',
                 ConditionExpression:
-                    'deliveryStatus = :pending AND (attribute_not_exists(leaseUntil) OR leaseUntil <= :now)',
+                    'deliveryStatus = :pending AND nextAttemptAt <= :due AND (attribute_not_exists(leaseUntil) OR leaseUntil <= :now)',
                 ExpressionAttributeValues: {
                     ':owner': leaseOwner,
                     ':until': now + 120,
                     ':pending': 'PENDING',
                     ':now': now,
+                    ':due': new Date(attemptedAt).toISOString(),
                     ':next': new Date((now + 120) * 1000).toISOString(),
                     ':one': 1,
                 },
