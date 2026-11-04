@@ -1,35 +1,26 @@
-export interface OrderInput {
-    customerId: string;
-    productId: string;
-    quantity: number;
-}
+import { z } from 'zod';
 
-export function isObject(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
+export const orderInputSchema = z.object({
+    customerId: z.string().trim().min(1).max(128),
+    productId: z.string().trim().min(1).max(128),
+    quantity: z.number().int().min(1).max(1000),
+});
+export type OrderInput = z.infer<typeof orderInputSchema>;
+export const orderIdSchema = z.uuid({ version: 'v4' });
+export const orderSchema = orderInputSchema.extend({
+    orderId: orderIdSchema,
+    ownerId: z.string().min(1),
+    status: z.enum(['RECEIVED', 'PROCESSED']),
+    createdAt: z.iso.datetime(),
+    updatedAt: z.iso.datetime(),
+    processedAt: z.iso.datetime().optional(),
+    fulfillmentId: z.string().optional(),
+});
+export type Order = z.infer<typeof orderSchema>;
 export function isOrderId(value: unknown): value is string {
-    return (
-        typeof value === 'string' &&
-        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
-    );
+    return orderIdSchema.safeParse(value).success;
 }
-
-export function parseOrderInput(value: unknown): OrderInput | undefined {
-    if (!isObject(value)) return undefined;
-    const { customerId, productId, quantity } = value;
-    if (
-        typeof customerId !== 'string' ||
-        !customerId.trim() ||
-        customerId.trim().length > 128 ||
-        typeof productId !== 'string' ||
-        !productId.trim() ||
-        productId.trim().length > 128 ||
-        typeof quantity !== 'number' ||
-        !Number.isInteger(quantity) ||
-        quantity < 1 ||
-        quantity > 1000
-    )
-        return undefined;
-    return { customerId: customerId.trim(), productId: productId.trim(), quantity };
+export function publicOrder(order: Order): Omit<Order, 'ownerId'> {
+    return orderSchema.omit({ ownerId: true }).parse(order);
 }
+export const processingMessageSchema = z.object({ orderId: orderIdSchema });

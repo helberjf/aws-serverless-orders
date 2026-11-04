@@ -23,7 +23,8 @@ region = "sa-east-1"
 image_repositories = []
 
 [default.package.parameters]
-resolve_s3 = true
+# CI and the reviewed local path use the explicitly provisioned artifact bucket.
+resolve_s3 = false
 
 [default.sync.parameters]
 watch = true

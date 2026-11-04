@@ -1,74 +1,118 @@
-# Operations and failure recovery
+# Operations and recovery
 
-Use the stack outputs to find resource names and URLs:
+Start with the stack's `DashboardUrl` output. Correlate by `orderId`, then by `eventId`, `messageId` and `requestId`. Never copy tokens, entire request bodies or customer data into incident notes. The health route is a liveness endpoint, not a test of DynamoDB/SQS availability.
 
-```bash
-aws cloudformation describe-stacks --stack-name aws-serverless-orders --region sa-east-1 \
-  --query 'Stacks[0].Outputs' --output table
+## Signals and alarms
+
+| Signal                                   | Interpretation and first check                                                                             |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Lambda Errors/Throttles                  | Unhandled failure, timeout or concurrency pressure; inspect the affected function and account quota        |
+| `AWSOrders/OperationFailures`            | Includes caught HTTP errors and individual failed batch records; useful when Lambda itself reports success |
+| API 5xx rate                             | More than 1% in a one-minute interval; also watches handled HTTP 500 responses during canaries             |
+| Orders/notification visible backlog ≥100 | Capacity or dependency problem; compare processing rate and throttles                                      |
+| Oldest message >300 seconds              | Work is not keeping up; inspect consumers and DLQs                                                         |
+| DLQ/failure-metadata depth ≥1            | Retries exhausted or a routing/subscription delivery failed                                                |
+| Publisher iterator age ≥60 seconds       | Stream processing is behind; durable recovery still relies on the outbox table                             |
+
+Queue depth and age metrics are approximate. Poison-message treatment and in-flight messages can make visible depth differ from total outstanding work. Alarm email is off by default; configured alarms still evaluate and participate in CodeDeploy rollback without email actions. Confirm optional SNS subscriptions before expecting alerts.
+
+CloudWatch Logs Insights examples (select this stack's Lambda log groups and a narrow time range):
+
+```sql
+fields @timestamp, eventType, orderId, eventId, requestId, messageId, status, durationMs, errorType
+| filter orderId = "d73b82b5-bcf4-4aae-a3b3-0e726019f8e0"
+| sort @timestamp asc
 ```
 
-The examples below use Bash. Set `TABLE`, `QUEUE_URL`, `DLQ_ARN`, and `PUBLISH_FAILURES_URL` from the corresponding outputs. These commands require an operator role with access to those specific resources.
-
-## Observe
-
-```bash
-aws logs tail /aws/lambda/aws-serverless-orders/process-order --region sa-east-1 --since 1h --follow
+```sql
+fields @timestamp, eventType, messageId, requestId, errorType
+| filter level = "ERROR"
+| stats count(*) as failures by eventType, errorType, bin(5m)
 ```
 
-Replace `process-order` with `create-order`, `get-order`, or `publish-order` to inspect another handler. Log records contain event names, message/order identifiers, and error types; request bodies are not logged. Logs are retained for 14 days. Lambda tracing and API Gateway tracing are enabled; this does not instrument every AWS SDK call as a separate trace segment.
-
-CloudWatch alarms track processing DLQ depth, publisher failure queue depth, and orders older than five minutes in the source queue. Configure alarm actions (for example an SNS subscription) in your own environment: the template creates alarms but does not send email or page anyone. Also monitor Lambda errors/throttles and the publisher's `IteratorAge`, especially during an incident.
-
-## Failed processing messages
-
-`OrdersDeadLetterQueue` contains original order messages after five unsuccessful receives. Both malformed messages and persistent service errors can arrive here. Inspect the message and the `process_order_failed` log first. A failure does not change the order to a terminal `FAILED` state; its status remains `RECEIVED` until successful processing.
-
-After fixing the cause, redrive valid messages with SQS's console or CLI:
-
-```bash
-aws sqs start-message-move-task --source-arn "$DLQ_ARN" --region sa-east-1
+```sql
+filter eventType = "invocation_completed"
+| stats count(*) as invocations, pct(durationMs, 95) as p95_ms by operation, bin(5m)
 ```
 
-Malformed messages cannot be repaired by retrying unchanged. Correct their payload or remove them only after recording why they are invalid. Reprocessing an already `PROCESSED` order is acknowledged without changing `processedAt`. A nonexistent order is retried, never created by the processor.
+X-Ray captures sampled HTTP/function/AWS SDK activity. Outbox records can be dispatched by a different invocation minutes later; use business IDs to bridge separate traces. Logs have fourteen-day retention, so export only approved diagnostic evidence before it expires.
 
-## Failed publishing and reconciliation
+## Order remains RECEIVED
 
-The DynamoDB stream publisher retries failed records up to 10 times or a record age of one hour, whichever is reached first. The underlying DynamoDB stream retains records for 24 hours. The SQS destination `PublishFailuresQueue` stores **failure metadata**, not complete order messages. Do not redrive that queue into `OrdersQueue`.
+1. Read the specific order consistently by `orderId`; verify the expected schema and owner. Do not scan the table to diagnose one order.
+2. Read `OrderCreated:<orderId>` in OutboxTable. If pending, inspect its attempts, next attempt time and any lease. If missing and the order predates the outbox migration, use the migration procedure.
+3. If published, inspect OrdersQueue and OrdersDeadLetterQueue, the ProcessOrder logs, IAM failures and concurrency alarms. Published means accepted by SQS, not successfully processed.
+4. A failed transaction leaves the order, fulfillment and `OrderProcessed` intent unchanged. Fix the underlying data, code, permission or capacity issue before redrive.
+5. Once `PROCESSED`, confirm the fulfillment ticket and notification path. Never reset a final order to RECEIVED to repeat processing.
 
-1. Inspect the publisher logs, failure metadata, IAM permissions, throttling, and SQS availability.
-2. Restore publishing, then identify older `RECEIVED` orders in the table. This paginated scan is suitable for this small demo, not a high-volume production reconciliation job.
-3. Check an individual order and enqueue its ID to recover it. A race with the normal publisher is harmless for the current atomic consumer operation.
-4. Verify `PROCESSED` with the API or a strongly consistent DynamoDB read. Remove failure metadata only after reconciliation.
+If all transport copies expired, a published outbox record is not a consumer-completion tracker. After verifying the known order is still RECEIVED and valid, an operator can re-enqueue its order ID. Keep the original ID and do not recreate the HTTP order. This is an explicit recovery action, not an automatic scan-based replay.
 
-```bash
-aws sqs receive-message --queue-url "$PUBLISH_FAILURES_URL" --region sa-east-1
+## Durable outbox recovery
 
-aws dynamodb scan --table-name "$TABLE" --region sa-east-1 --consistent-read \
-  --filter-expression '#s = :received' \
-  --expression-attribute-names '{"#s":"status"}' \
-  --expression-attribute-values '{":received":{"S":"RECEIVED"}}' \
-  --projection-expression 'orderId, createdAt, #s'
+The scheduled ReconcileOutbox handler queries `PendingByNextAttempt` with `deliveryStatus=PENDING` and `nextAttemptAt<=now`. It attempts at most forty records per run. Successful acknowledgments set PUBLISHED and a seven-day TTL. Pending work has no TTL; physical deletion of expired DynamoDB records is asynchronous.
 
-# Replace the example UUID with the verified pending order ID.
-aws sqs send-message --queue-url "$QUEUE_URL" --region sa-east-1 \
-  --message-body '{"orderId":"d73b82b5-bcf4-4aae-a3b3-0e726019f8e0"}'
+To inspect due work, set `OUTBOX_TABLE` from the stack output and create a local JSON values file with the current UTC timestamp:
+
+```json
+{
+  ":pending": { "S": "PENDING" },
+  ":now": { "S": "2026-11-04T12:00:00.000Z" }
+}
 ```
 
-Do not assume that an empty failure queue proves there are no pending orders. Destination delivery can fail, streams expire, and disabling the event mapping for too long loses the stream history. The durable order table is the source for reconciliation. For a larger system, add a pending-status index, automated reconciliation, and alerts for failed destination delivery.
+```bash
+aws dynamodb query --table-name "$OUTBOX_TABLE" --index-name PendingByNextAttempt --key-condition-expression 'deliveryStatus = :pending AND nextAttemptAt <= :now' --expression-attribute-values file://due-values.json --limit 20 --region sa-east-1
+```
 
-## Upgrade from the original create-order application
+Use a fresh timestamp, not the illustrative one. The GSI is eventually consistent; dispatch performs a consistent item read and conditional lease before sending. Do not manually clear a live lease. An interrupted invocation becomes eligible after its 120-second lease. Failed sends back off from 30 seconds up to one hour; the five-minute scheduler adds recovery latency.
 
-- Install dependencies at the repository root with `npm ci`; the nested `src/create-order/package.json` has been consolidated into one lockfile.
-- `POST /orders` still returns `201` and a `RECEIVED` order. Publishing now happens asynchronously from committed DynamoDB inserts. A successful response means the order is persisted, not yet processed.
-- API requests now require AWS Signature Version 4 and `execute-api:Invoke`. Update callers before deploying the API change.
-- The existing `OrdersTable`, `OrdersQueue`, `CreateOrderFunction`, and implicit API logical IDs are preserved. Inspect the CloudFormation change set before accepting it.
-- Records created before Streams were enabled are not automatically replayed. Review old `RECEIVED` orders using the reconciliation procedure above.
-- New managed log groups use `/aws/lambda/<stack-name>/<handler-name>`. Older automatically created log groups may still exist; review them before deleting them.
+PublishFailuresQueue contains DynamoDB stream failure metadata, not directly replayable order messages. Investigate the stream batch metadata and outbox state; do not redrive those records into OrdersQueue. The scheduled query recovers pending intents even after the source stream record expires. Historical failure metadata may keep its depth alarm active after recovery; remove only specifically reviewed diagnostic messages after recording the outcome.
+
+## Processing DLQ redrive
+
+OrdersDeadLetterQueue and NotificationDeadLetterQueue retain messages for fourteen days. Preserve a failing sample privately, identify and fix the cause, and verify the consumer with tests before moving messages. Missing orders, malformed messages and conflicting notification payloads will fail again without correction.
+
+For an authorized redrive of the **orders** DLQ, get the two ARNs from stack outputs and limit the rate:
+
+```bash
+aws sqs start-message-move-task --source-arn "$ORDERS_DLQ_ARN" --destination-arn "$ORDERS_QUEUE_ARN" --max-number-of-messages-per-second 1 --region sa-east-1
+aws sqs list-message-move-tasks --source-arn "$ORDERS_DLQ_ARN" --region sa-east-1
+```
+
+These commands mutate queues and require explicit operational authorization. They are instructions, not actions performed during this repository update. Monitor source/target depth, failures, final order state and fulfillment IDs. Do not delete/recreate orders or idempotency records to force a replay. NotificationQueue messages are EventBridge envelopes and belong in that notification queue, not the order queue.
+
+## Notification failures
+
+| Location                                    | Failed boundary                        | Recovery                                                                                            |
+| ------------------------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Pending `OrderProcessed` intent             | Application→EventBridge acknowledgment | Dispatcher/scheduled retry after dependency repair                                                  |
+| EventDeliveryDeadLetterQueue                | EventBridge rule→NotificationsQueue    | Inspect target permissions and replay the reviewed event envelope                                   |
+| NotificationDeadLetterQueue                 | Notification consumer transaction      | Fix payload/permission/state issue, then controlled redrive to NotificationsQueue                   |
+| Pending `OrderNotificationRequested` intent | Application→SNS acknowledgment         | Dispatcher/scheduled retry                                                                          |
+| NotificationDeliveryDeadLetterQueue         | SNS→audit SQS subscription             | Fix subscription/queue policy; replay only the reviewed notification using its original business ID |
+
+Notification receipts have no TTL. A late duplicate `OrderProcessed` event with the same content is acknowledged without creating a new notification intent, even after published outbox rows expire. Different content for the same event ID is a conflict and remains visible through retries/DLQ.
+
+SNS Standard can still deliver duplicate notifications following ambiguous publication or subscription retry. Consumers of the audit queue must deduplicate `OrderNotificationRequested:<orderId>` before non-idempotent external effects. No automatic republish of every published event is provided.
+
+## Failed deployments
+
+Inspect CloudFormation events and `scripts/inspect-deployment.py`. Record the attempted revision, Change Set ARN, deployment IDs, alarms and alias versions. `UPDATE_ROLLBACK_COMPLETE` means the stack update rolled back; it does not by itself prove a candidate received traffic or that a specific business fault was detected.
+
+Do not start another change while a stack is in progress or rollback has failed. Resolve any failed rollback with an authorized operator, then plan a new Change Set. Retained data and externally delivered messages are not undone by code rollback. Keep event schemas additive and maintain readers that understand existing rows and envelopes. The IAM→Cognito migration needs its own compatibility plan.
 
 ## Cleanup
 
+Cleanup destroys queues, logs and service configuration. Obtain authorization, stop producers, inspect pending/outstanding work, preserve required test evidence and confirm the exact account/region/stack first:
+
 ```bash
-sam delete --stack-name aws-serverless-orders --region sa-east-1
+aws sts get-caller-identity
+aws cloudformation list-stack-resources --stack-name orders-development --region sa-east-1
+sam delete --stack-name orders-development --region sa-east-1
 ```
 
-The orders table is intentionally retained, including on replacement. Save its physical name before deleting the stack; retained tables and backups can continue to incur costs. Delete retained data separately only when it is no longer needed. Stack deletion removes the queues and their remaining messages, so inspect or recover pending work first.
+SAM asks for confirmation; do not add flags that bypass the review. Queue messages and unexported logs are deleted with their resources. Durable DynamoDB tables and the Cognito user pool use Retain and remain billable/managed outside the deleted stack until explicitly handled. Retention is intentional data protection, not full cleanup. Recreating a stack does not automatically re-adopt these retained resources.
+
+The bootstrap artifact bucket and OIDC provider are also retained. Keep artifacts needed for rollback; its lifecycle expires old noncurrent versions after thirty days but does not delete all current artifacts. Delete the bootstrap only after application stacks no longer depend on its execution role or bucket. An account-wide OIDC provider may serve other repositories. Do not remove it as part of a casual lab cleanup.
+
+Optional alarm KMS keys are scheduled for deletion when removed with the stack (seven-day waiting period); review encrypted data dependencies first. Inspect billing after cleanup for retained table storage/PITR, artifact storage and resources in other regions. This task did not execute AWS cleanup.

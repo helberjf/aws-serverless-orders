@@ -1,0 +1,121 @@
+name: Review and deploy
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (production requires review after planning)
+        type: choice
+        options: [development, production]
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aws-orders-deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      deployments: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python scripts/verify-environment.py --environment "$TARGET_ENVIRONMENT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+  verify:
+    needs: guard
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+  plan:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ format('{0}-plan', inputs.environment) }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STACK_NAME: ${{ vars.STACK_NAME }}
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      EXECUTION_ROLE: ${{ vars.CLOUDFORMATION_EXECUTION_ROLE_ARN }}
+      TARGET_ENVIRONMENT: ${{ inputs.environment }}
+      REVISION: ${{ github.sha }}
+      SAM_CLI_TELEMETRY: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: npm ci
+      - run: python -m pip install -r requirements-dev.txt
+      - run: npm run build
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: orders-plan-${{ github.run_id }}
+      - run: mkdir -p .deploy
+      - run: sam package --template-file .aws-sam/build/template.yaml --s3-bucket "$ARTIFACT_BUCKET" --region "$AWS_REGION" --output-template-file .deploy/packaged.yaml
+      - run: python scripts/deployment.py plan --stack-name "$STACK_NAME" --environment "$TARGET_ENVIRONMENT" --revision "$REVISION" --region "$AWS_REGION" --artifact-bucket "$ARTIFACT_BUCKET" --execution-role "$EXECUTION_ROLE"
+      - name: Show change set for review
+        run: python scripts/summarize-plan.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reviewed-change-set-${{ github.run_id }}
+          path: .deploy/review.json
+          include-hidden-files: true
+          retention-days: 14
+  apply:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+      deployments: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STACK_NAME: ${{ vars.STACK_NAME }}
+      TARGET_ENVIRONMENT: ${{ inputs.environment }}
+      REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install boto3==1.43.108 PyYAML==6.0.3
+      - run: python scripts/verify-environment.py --environment "$TARGET_ENVIRONMENT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reviewed-change-set-${{ github.run_id }}
+          path: .deploy
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: orders-apply-${{ github.run_id }}
+      - run: python scripts/deployment.py apply --stack-name "$STACK_NAME" --environment "$TARGET_ENVIRONMENT" --revision "$REVISION" --region "$AWS_REGION"

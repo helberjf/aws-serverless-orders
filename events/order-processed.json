@@ -1,0 +1,18 @@
+{
+  "version": "0",
+  "id": "f6d6271d-357b-4775-bdd5-2c9032ccbe40",
+  "source": "com.helberjf.orders",
+  "detail-type": "OrderProcessed",
+  "account": "123456789012",
+  "time": "2026-11-04T12:00:01.000Z",
+  "region": "sa-east-1",
+  "resources": [],
+  "detail": {
+    "schemaVersion": 1,
+    "eventId": "OrderProcessed:d73b82b5-bcf4-4aae-a3b3-0e726019f8e0",
+    "orderId": "d73b82b5-bcf4-4aae-a3b3-0e726019f8e0",
+    "fulfillmentId": "fulfillment:d73b82b5-bcf4-4aae-a3b3-0e726019f8e0",
+    "quantity": 2,
+    "processedAt": "2026-11-04T12:00:01.000Z"
+  }
+}

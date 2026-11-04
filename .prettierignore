@@ -2,3 +2,5 @@ node_modules
 coverage
 .aws-sam
 package-lock.json
+.tokens
+.deploy

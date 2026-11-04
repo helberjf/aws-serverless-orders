@@ -1,21 +1,61 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Event-driven order processing with DynamoDB Streams, SQS and idempotent Lambda consumers.
-
 Globals:
   Function:
     Timeout: 10
     MemorySize: 256
     Runtime: nodejs24.x
-    Architectures: [x86_64]
+    Architectures:
+      - x86_64
     Tracing: Active
     LoggingConfig:
       LogFormat: JSON
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME:
+          Ref: AWS::StackName
+        POWERTOOLS_LOG_LEVEL: INFO
+        POWERTOOLS_TRACER_CAPTURE_RESPONSE: 'false'
+        POWERTOOLS_TRACER_CAPTURE_ERROR: 'false'
+        ENVIRONMENT:
+          Ref: EnvironmentName
+    Tags:
+      Project:
+        Ref: AWS::StackName
+      Environment:
+        Ref: EnvironmentName
   Api:
     TracingEnabled: true
     Auth:
-      DefaultAuthorizer: AWS_IAM
-
+      DefaultAuthorizer: OrdersCognitoAuth
+      Authorizers:
+        OrdersCognitoAuth:
+          UserPoolArn:
+            Fn::GetAtt:
+              - OrdersUserPool
+              - Arn
+    MethodSettings:
+      - ResourcePath: /*
+        HttpMethod: '*'
+        MetricsEnabled: false
+        DataTraceEnabled: false
+        ThrottlingRateLimit: 10
+        ThrottlingBurstLimit: 20
+    GatewayResponses:
+      UNAUTHORIZED:
+        StatusCode: 401
+        ResponseTemplates:
+          application/json: '{"code":"UNAUTHORIZED","message":"Authentication is required","requestId":"$context.requestId"}'
+      ACCESS_DENIED:
+        StatusCode: 403
+        ResponseTemplates:
+          application/json: '{"code":"FORBIDDEN","message":"Access denied","requestId":"$context.requestId"}'
+      DEFAULT_5XX:
+        ResponseTemplates:
+          application/json: '{"code":"INTERNAL_ERROR","message":"Internal server error","requestId":"$context.requestId"}'
+    Name:
+      Fn::Sub: ${AWS::StackName}-api
 Resources:
   OrdersTable:
     Type: AWS::DynamoDB::Table
@@ -33,193 +73,259 @@ Resources:
         StreamViewType: KEYS_ONLY
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
-
   OrdersDeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
-
   PublishFailuresQueue:
     Type: AWS::SQS::Queue
     Properties:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
-
   OrdersQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 180
+      VisibilityTimeout: 181
       MessageRetentionPeriod: 345600
       SqsManagedSseEnabled: true
       RedrivePolicy:
-        deadLetterTargetArn: !GetAtt OrdersDeadLetterQueue.Arn
+        deadLetterTargetArn:
+          Fn::GetAtt:
+            - OrdersDeadLetterQueue
+            - Arn
         maxReceiveCount: 5
-
   CreateOrderFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: .
       Handler: src/create-order/app.lambdaHandler
       LoggingConfig:
-        LogGroup: !Ref CreateOrderLogGroup
+        LogGroup:
+          Ref: CreateOrderLogGroup
       Environment:
         Variables:
-          ORDERS_TABLE: !Ref OrdersTable
-      Policies:
-        - Statement:
-            - Effect: Allow
-              Action: dynamodb:PutItem
-              Resource: !GetAtt OrdersTable.Arn
+          ORDERS_TABLE:
+            Ref: OrdersTable
+          OUTBOX_TABLE:
+            Ref: OutboxTable
+          IDEMPOTENCY_TABLE:
+            Ref: IdempotencyTable
+          COGNITO_CLIENT_ID:
+            Ref: OrdersUserPoolClient
+          COGNITO_ISSUER:
+            Fn::Sub: https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${OrdersUserPool}
       Events:
         CreateOrderApi:
           Type: Api
           Properties:
             Path: /orders
             Method: post
+            Auth:
+              Authorizer: OrdersCognitoAuth
+              AuthorizationScopes:
+                - orders/write
+      Role:
+        Fn::GetAtt:
+          - CreateOrderFunctionRole
+          - Arn
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      DeploymentPreference:
+        Type: Canary10Percent10Minutes
+        Role:
+          Fn::GetAtt:
+            - CanaryDeploymentRole
+            - Arn
+        Alarms:
+          - Ref: CreateOrderFunctionErrorsAlarm
+          - Ref: CreateOrderFunctionThrottlesAlarm
+          - Ref: ApiServerErrorsAlarm
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
         Minify: true
         Target: es2022
         Sourcemap: false
-        EntryPoints: [src/create-order/app.ts]
-
+        EntryPoints:
+          - src/create-order/app.ts
   GetOrderFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: .
       Handler: src/get-order/app.lambdaHandler
       LoggingConfig:
-        LogGroup: !Ref GetOrderLogGroup
+        LogGroup:
+          Ref: GetOrderLogGroup
       Environment:
         Variables:
-          ORDERS_TABLE: !Ref OrdersTable
-      Policies:
-        - Statement:
-            - Effect: Allow
-              Action: dynamodb:GetItem
-              Resource: !GetAtt OrdersTable.Arn
+          ORDERS_TABLE:
+            Ref: OrdersTable
+          COGNITO_CLIENT_ID:
+            Ref: OrdersUserPoolClient
+          COGNITO_ISSUER:
+            Fn::Sub: https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${OrdersUserPool}
       Events:
         GetOrderApi:
           Type: Api
           Properties:
             Path: /orders/{orderId}
             Method: get
+            Auth:
+              Authorizer: OrdersCognitoAuth
+              AuthorizationScopes:
+                - orders/read
+      Role:
+        Fn::GetAtt:
+          - GetOrderFunctionRole
+          - Arn
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      DeploymentPreference:
+        Type: Canary10Percent10Minutes
+        Role:
+          Fn::GetAtt:
+            - CanaryDeploymentRole
+            - Arn
+        Alarms:
+          - Ref: GetOrderFunctionErrorsAlarm
+          - Ref: GetOrderFunctionThrottlesAlarm
+          - Ref: ApiServerErrorsAlarm
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
         Minify: true
         Target: es2022
         Sourcemap: false
-        EntryPoints: [src/get-order/app.ts]
-
+        EntryPoints:
+          - src/get-order/app.ts
   PublishOrderFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: .
       Handler: src/publish-order/app.lambdaHandler
       LoggingConfig:
-        LogGroup: !Ref PublishOrderLogGroup
+        LogGroup:
+          Ref: PublishOrderLogGroup
       Timeout: 30
       Environment:
         Variables:
-          ORDERS_QUEUE_URL: !Ref OrdersQueue
-      Policies:
-        - SQSSendMessagePolicy:
-            QueueName: !GetAtt OrdersQueue.QueueName
-        - SQSSendMessagePolicy:
-            QueueName: !GetAtt PublishFailuresQueue.QueueName
-        - Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:DescribeStream
-                - dynamodb:GetRecords
-                - dynamodb:GetShardIterator
-                - dynamodb:ListStreams
-              Resource: !GetAtt OrdersTable.StreamArn
+          ORDERS_QUEUE_URL:
+            Ref: OrdersQueue
+          OUTBOX_TABLE:
+            Ref: OutboxTable
+          ORDERS_EVENT_BUS:
+            Ref: OrdersEventBus
+          NOTIFICATIONS_TOPIC_ARN:
+            Ref: NotificationsTopic
       Events:
         OrderInserted:
           Type: DynamoDB
           Properties:
-            Stream: !GetAtt OrdersTable.StreamArn
+            Stream:
+              Fn::GetAtt:
+                - OutboxTable
+                - StreamArn
             StartingPosition: TRIM_HORIZON
-            BatchSize: 10
+            BatchSize: 5
             MaximumRetryAttempts: 10
             MaximumRecordAgeInSeconds: 3600
             BisectBatchOnFunctionError: true
-            FunctionResponseTypes: [ReportBatchItemFailures]
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
             FilterCriteria:
               Filters:
                 - Pattern: '{"eventName":["INSERT"]}'
             DestinationConfig:
               OnFailure:
                 Type: SQS
-                Destination: !GetAtt PublishFailuresQueue.Arn
+                Destination:
+                  Fn::GetAtt:
+                    - PublishFailuresQueue
+                    - Arn
+      Role:
+        Fn::GetAtt:
+          - PublishOrderFunctionRole
+          - Arn
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
         Minify: true
         Target: es2022
         Sourcemap: false
-        EntryPoints: [src/publish-order/app.ts]
-
+        EntryPoints:
+          - src/publish-order/app.ts
+    DependsOn:
+      - OrdersProcessedRule
+      - OrdersEventQueuePolicy
+      - NotificationAuditSubscription
   ProcessOrderFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: .
       Handler: src/process-order/app.lambdaHandler
       LoggingConfig:
-        LogGroup: !Ref ProcessOrderLogGroup
+        LogGroup:
+          Ref: ProcessOrderLogGroup
       Timeout: 30
       Environment:
         Variables:
-          ORDERS_TABLE: !Ref OrdersTable
-      Policies:
-        - SQSPollerPolicy:
-            QueueName: !GetAtt OrdersQueue.QueueName
-        - Statement:
-            - Effect: Allow
-              Action: [dynamodb:UpdateItem, dynamodb:GetItem]
-              Resource: !GetAtt OrdersTable.Arn
+          ORDERS_TABLE:
+            Ref: OrdersTable
+          OUTBOX_TABLE:
+            Ref: OutboxTable
+          FULFILLMENTS_TABLE:
+            Ref: FulfillmentsTable
       Events:
         Orders:
           Type: SQS
           Properties:
-            Queue: !GetAtt OrdersQueue.Arn
+            Queue:
+              Fn::GetAtt:
+                - OrdersQueue
+                - Arn
             BatchSize: 10
-            FunctionResponseTypes: [ReportBatchItemFailures]
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
             ScalingConfig:
               MaximumConcurrency: 5
+            MaximumBatchingWindowInSeconds: 1
+      Role:
+        Fn::GetAtt:
+          - ProcessOrderFunctionRole
+          - Arn
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
         Minify: true
         Target: es2022
         Sourcemap: false
-        EntryPoints: [src/process-order/app.ts]
-
+        EntryPoints:
+          - src/process-order/app.ts
   CreateOrderLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/create-order
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/create-order
       RetentionInDays: 14
   GetOrderLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/get-order
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/get-order
       RetentionInDays: 14
   PublishOrderLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/publish-order
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/publish-order
       RetentionInDays: 14
   ProcessOrderLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/process-order
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/process-order
       RetentionInDays: 14
-
   OrdersDeadLetterAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -228,28 +334,48 @@ Resources:
       MetricName: ApproximateNumberOfMessagesVisible
       Dimensions:
         - Name: QueueName
-          Value: !GetAtt OrdersDeadLetterQueue.QueueName
+          Value:
+            Fn::GetAtt:
+              - OrdersDeadLetterQueue
+              - QueueName
       Statistic: Maximum
       Period: 60
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-OrdersDeadLetterAlarm
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
   PublishFailuresAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmDescription: Stream publishing failed. Inspect metadata and reconcile RECEIVED orders.
+      AlarmDescription: Stream retries exhausted. Inspect failure metadata and the durable outbox; see docs/operations.md.
       Namespace: AWS/SQS
       MetricName: ApproximateNumberOfMessagesVisible
       Dimensions:
         - Name: QueueName
-          Value: !GetAtt PublishFailuresQueue.QueueName
+          Value:
+            Fn::GetAtt:
+              - PublishFailuresQueue
+              - QueueName
       Statistic: Maximum
       Period: 60
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-PublishFailuresAlarm
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
   OrderBacklogAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -258,39 +384,1764 @@ Resources:
       MetricName: ApproximateAgeOfOldestMessage
       Dimensions:
         - Name: QueueName
-          Value: !GetAtt OrdersQueue.QueueName
+          Value:
+            Fn::GetAtt:
+              - OrdersQueue
+              - QueueName
       Statistic: Maximum
       Period: 60
       EvaluationPeriods: 2
       Threshold: 300
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-OrderBacklogAlarm
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: idempotencyKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotencyKey
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+  FulfillmentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  OutboxTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: deliveryStatus
+          AttributeType: S
+        - AttributeName: nextAttemptAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: KEYS_ONLY
+      GlobalSecondaryIndexes:
+        - IndexName: PendingByNextAttempt
+          KeySchema:
+            - AttributeName: deliveryStatus
+              KeyType: HASH
+            - AttributeName: nextAttemptAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+  OrdersEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name:
+        Fn::Sub: ${AWS::StackName}-orders
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+  ReconcileOutboxFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/reconcile-outbox/app.lambdaHandler
+      LoggingConfig:
+        LogGroup:
+          Ref: ReconcileOutboxLogGroup
+      Timeout: 90
+      Environment:
+        Variables:
+          ORDERS_QUEUE_URL:
+            Ref: OrdersQueue
+          OUTBOX_TABLE:
+            Ref: OutboxTable
+          ORDERS_EVENT_BUS:
+            Ref: OrdersEventBus
+          NOTIFICATIONS_TOPIC_ARN:
+            Ref: NotificationsTopic
+      Events:
+        ReconcileSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Enabled: true
+      Role:
+        Fn::GetAtt:
+          - ReconcileOutboxFunctionRole
+          - Arn
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        EntryPoints:
+          - src/reconcile-outbox/app.ts
+    DependsOn:
+      - OrdersProcessedRule
+      - OrdersEventQueuePolicy
+      - NotificationAuditSubscription
+  ReconcileOutboxLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/reconcile-outbox
+      RetentionInDays: 14
+  NotificationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  EventDeliveryDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  NotificationDeliveryDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  NotificationAuditQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600
+  NotificationsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 181
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+            - NotificationDeadLetterQueue
+            - Arn
+        maxReceiveCount: 5
+  OrdersProcessedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName:
+        Ref: OrdersEventBus
+      EventPattern:
+        source:
+          - com.helberjf.orders
+        detail-type:
+          - OrderProcessed
+        detail:
+          schemaVersion:
+            - 1
+      Targets:
+        - Id: Notifications
+          Arn:
+            Fn::GetAtt:
+              - NotificationsQueue
+              - Arn
+          DeadLetterConfig:
+            Arn:
+              Fn::GetAtt:
+                - EventDeliveryDeadLetterQueue
+                - Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 86400
+            MaximumRetryAttempts: 185
+  OrdersEventQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - Ref: NotificationsQueue
+        - Ref: EventDeliveryDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource:
+              - Fn::GetAtt:
+                  - NotificationsQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - EventDeliveryDeadLetterQueue
+                  - Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  Fn::GetAtt:
+                    - OrdersProcessedRule
+                    - Arn
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+          - Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource:
+              - Fn::GetAtt:
+                  - NotificationsQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - EventDeliveryDeadLetterQueue
+                  - Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  NotificationAuditQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - Ref: NotificationAuditQueue
+        - Ref: NotificationDeliveryDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource:
+              - Fn::GetAtt:
+                  - NotificationAuditQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - NotificationDeliveryDeadLetterQueue
+                  - Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  Ref: NotificationsTopic
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+          - Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource:
+              - Fn::GetAtt:
+                  - NotificationAuditQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - NotificationDeliveryDeadLetterQueue
+                  - Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  NotificationAuditSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: NotificationAuditQueuePolicy
+    Properties:
+      TopicArn:
+        Ref: NotificationsTopic
+      Protocol: sqs
+      Endpoint:
+        Fn::GetAtt:
+          - NotificationAuditQueue
+          - Arn
+      RawMessageDelivery: true
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+            - NotificationDeliveryDeadLetterQueue
+            - Arn
+  NotificationReceiptsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+  TestEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasTestEmail
+    Properties:
+      TopicArn:
+        Ref: NotificationsTopic
+      Protocol: email
+      Endpoint:
+        Ref: TestNotificationEmail
+  NotifyOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/notify-order/app.lambdaHandler
+      LoggingConfig:
+        LogGroup:
+          Ref: NotifyOrderLogGroup
+      Timeout: 30
+      Environment:
+        Variables:
+          OUTBOX_TABLE:
+            Ref: OutboxTable
+          NOTIFICATION_RECEIPTS_TABLE:
+            Ref: NotificationReceiptsTable
+      Events:
+        Notifications:
+          Type: SQS
+          Properties:
+            Queue:
+              Fn::GetAtt:
+                - NotificationsQueue
+                - Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: 5
+      Role:
+        Fn::GetAtt:
+          - NotifyOrderFunctionRole
+          - Arn
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        EntryPoints:
+          - src/notify-order/app.ts
+  NotifyOrderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/notify-order
+      RetentionInDays: 14
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/health/app.lambdaHandler
+      LoggingConfig:
+        LogGroup:
+          Ref: HealthLogGroup
+      Events:
+        Health:
+          Type: Api
+          Properties:
+            Path: /health
+            Method: get
+            Auth:
+              Authorizer: NONE
+      Role:
+        Fn::GetAtt:
+          - HealthFunctionRole
+          - Arn
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      DeploymentPreference:
+        Type: Canary10Percent10Minutes
+        Role:
+          Fn::GetAtt:
+            - CanaryDeploymentRole
+            - Arn
+        Alarms:
+          - Ref: HealthFunctionErrorsAlarm
+          - Ref: HealthFunctionThrottlesAlarm
+          - Ref: ApiServerErrorsAlarm
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        EntryPoints:
+          - src/health/app.ts
+  HealthLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}/health
+      RetentionInDays: 14
+  OrdersUserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName:
+        Fn::Sub: ${AWS::StackName}-users
+      UserPoolTier: LITE
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 1
+      MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: admin_only
+            Priority: 1
+      UserPoolTags:
+        Project:
+          Ref: AWS::StackName
+  OrdersResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId:
+        Ref: OrdersUserPool
+      Identifier: orders
+      Name: Orders API
+      Scopes:
+        - ScopeName: read
+          ScopeDescription: Read own orders
+        - ScopeName: write
+          ScopeDescription: Create own orders
+  OrdersUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: OrdersResourceServer
+    Properties:
+      UserPoolId:
+        Ref: OrdersUserPool
+      ClientName:
+        Fn::Sub: ${AWS::StackName}-public-client
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - orders/read
+        - orders/write
+      CallbackURLs:
+        - Ref: OAuthCallbackUrl
+      LogoutURLs:
+        - Ref: OAuthCallbackUrl
+      SupportedIdentityProviders:
+        - COGNITO
+      AccessTokenValidity: 15
+      IdTokenValidity: 15
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+  OrdersUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId:
+        Ref: OrdersUserPool
+      Domain:
+        Fn::Sub:
+          - orders-${AWS::AccountId}-${Suffix}
+          - Suffix:
+              Fn::Select:
+                - 0
+                - Fn::Split:
+                    - '-'
+                    - Fn::Select:
+                        - 2
+                        - Fn::Split:
+                            - /
+                            - Ref: AWS::StackId
+  QueueTlsPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - Ref: OrdersDeadLetterQueue
+        - Ref: PublishFailuresQueue
+        - Ref: OrdersQueue
+        - Ref: NotificationDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource:
+              - Fn::GetAtt:
+                  - OrdersDeadLetterQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - PublishFailuresQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - OrdersQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - NotificationDeadLetterQueue
+                  - Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  NotificationTopicTlsPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - Ref: NotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: sns:Publish
+            Resource:
+              Ref: NotificationsTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  AlarmEncryptionKey:
+    Type: AWS::KMS::Key
+    Condition: HasAlarmEmail
+    Properties:
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: CloudWatchNotifications
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*
+      Tags:
+        - Key: Project
+          Value:
+            Ref: AWS::StackName
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      KmsMasterKeyId:
+        Ref: AlarmEncryptionKey
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn:
+        Ref: AlarmTopic
+      Protocol: email
+      Endpoint:
+        Ref: AlarmEmail
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasAlarmEmail
+    Properties:
+      Topics:
+        - Ref: AlarmTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource:
+              Ref: AlarmTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*
+          - Effect: Deny
+            Principal: '*'
+            Action: sns:Publish
+            Resource:
+              Ref: AlarmTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  CreateOrderFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-CreateOrderFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: CreateOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  CreateOrderFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-CreateOrderFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: CreateOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  GetOrderFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-GetOrderFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: GetOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  GetOrderFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-GetOrderFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: GetOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  PublishOrderFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-PublishOrderFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: PublishOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  PublishOrderFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-PublishOrderFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: PublishOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  ProcessOrderFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-ProcessOrderFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: ProcessOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  ProcessOrderFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-ProcessOrderFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: ProcessOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  ReconcileOutboxFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-ReconcileOutboxFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: ReconcileOutboxFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  ReconcileOutboxFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-ReconcileOutboxFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: ReconcileOutboxFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotifyOrderFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotifyOrderFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: NotifyOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotifyOrderFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotifyOrderFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: NotifyOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  HealthFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-HealthFunctionErrorsAlarm
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: HealthFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  HealthFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-HealthFunctionThrottlesAlarm
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: HealthFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  OrdersQueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-OrdersQueueBacklogAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - OrdersQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotificationsQueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotificationsQueueBacklogAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - NotificationsQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotificationsQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotificationsQueueAgeAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - NotificationsQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotificationDeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotificationDeadLetterQueueAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - NotificationDeadLetterQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  EventDeliveryDeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-EventDeliveryDeadLetterQueueAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - EventDeliveryDeadLetterQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  NotificationDeliveryDeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-NotificationDeliveryDeadLetterQueueAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - NotificationDeliveryDeadLetterQueue
+              - QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  PublisherIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-PublisherIteratorAgeAlarm
+      Namespace: AWS/Lambda
+      MetricName: IteratorAge
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: PublishOrderFunction
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 60000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  OperationFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-OperationFailuresAlarm
+      Namespace: AWSOrders
+      MetricName: OperationFailures
+      Dimensions:
+        - Name: service
+          Value:
+            Ref: AWS::StackName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  ApiServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-ApiServerErrorsAlarm
+      AlarmDescription: API 5xx rate above 1%; includes errors returned normally by HTTP Lambda handlers.
+      Metrics:
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: 5XXError
+              Dimensions:
+                - Name: ApiName
+                  Value:
+                    Fn::Sub: ${AWS::StackName}-api
+                - Name: Stage
+                  Value: Prod
+            Period: 60
+            Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: Count
+              Dimensions:
+                - Name: ApiName
+                  Value:
+                    Fn::Sub: ${AWS::StackName}-api
+                - Name: Stage
+                  Value: Prod
+            Period: 60
+            Stat: Sum
+        - Id: rate
+          Expression: IF(requests > 0, 100 * errors / requests, 0)
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmEmail
+          - - Ref: AlarmTopic
+          - []
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName:
+        Fn::Sub: ${AWS::StackName}-operations
+      DashboardBody:
+        Fn::Sub: '{"widgets":[{"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Lambda errors
+          and throttles","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWS/Lambda","Errors","FunctionName","${CreateOrderFunction}"],["AWS/Lambda","Throttles","FunctionName","${CreateOrderFunction}"],["AWS/Lambda","Errors","FunctionName","${GetOrderFunction}"],["AWS/Lambda","Throttles","FunctionName","${GetOrderFunction}"],["AWS/Lambda","Errors","FunctionName","${PublishOrderFunction}"],["AWS/Lambda","Throttles","FunctionName","${PublishOrderFunction}"],["AWS/Lambda","Errors","FunctionName","${ProcessOrderFunction}"],["AWS/Lambda","Throttles","FunctionName","${ProcessOrderFunction}"],["AWS/Lambda","Errors","FunctionName","${ReconcileOutboxFunction}"],["AWS/Lambda","Throttles","FunctionName","${ReconcileOutboxFunction}"],["AWS/Lambda","Errors","FunctionName","${NotifyOrderFunction}"],["AWS/Lambda","Throttles","FunctionName","${NotifyOrderFunction}"],["AWS/Lambda","Errors","FunctionName","${HealthFunction}"],["AWS/Lambda","Throttles","FunctionName","${HealthFunction}"]]}},{"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Order
+          and notification queue backlog","region":"${AWS::Region}","view":"timeSeries","stat":"Maximum","period":60,"metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${OrdersQueue.QueueName}"],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${NotificationsQueue.QueueName}"],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${OrdersDeadLetterQueue.QueueName}"],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${NotificationDeadLetterQueue.QueueName}"]]}},{"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"API
+          requests and 5xx","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWS/ApiGateway","Count","ApiName","${AWS::StackName}-api","Stage","Prod"],["AWS/ApiGateway","5XXError","ApiName","${AWS::StackName}-api","Stage","Prod"]]}},{"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Application
+          failures and request volume","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWSOrders","OperationFailures","service","${AWS::StackName}"],["AWSOrders","HttpRequests","service","${AWS::StackName}"],["AWSOrders","HttpServerErrors","service","${AWS::StackName}"]]}}]}'
+  CreateOrderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  Fn::GetAtt:
+                    - IdempotencyTable
+                    - Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource:
+                  - Fn::GetAtt:
+                      - OrdersTable
+                      - Arn
+                  - Fn::GetAtt:
+                      - IdempotencyTable
+                      - Arn
+                  - Fn::GetAtt:
+                      - OutboxTable
+                      - Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - CreateOrderLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  GetOrderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersTable
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - GetOrderLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  PublishOrderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersQueue
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  Fn::GetAtt:
+                    - PublishFailuresQueue
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  Fn::GetAtt:
+                    - OutboxTable
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  Fn::GetAtt:
+                    - OutboxTable
+                    - StreamArn
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersEventBus
+                    - Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource:
+                  Ref: NotificationsTopic
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
+                Condition:
+                  StringEquals:
+                    kms:ViaService:
+                      Fn::Sub: sns.${AWS::Region}.${AWS::URLSuffix}
+                  ForAnyValue:StringEquals:
+                    kms:ResourceAliases: alias/aws/sns
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - PublishOrderLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  ProcessOrderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersQueue
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersTable
+                    - Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource:
+                  - Fn::GetAtt:
+                      - FulfillmentsTable
+                      - Arn
+                  - Fn::GetAtt:
+                      - OutboxTable
+                      - Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - ProcessOrderLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  ReconcileOutboxFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersQueue
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  Fn::GetAtt:
+                    - OutboxTable
+                    - Arn
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersEventBus
+                    - Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource:
+                  Ref: NotificationsTopic
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
+                Condition:
+                  StringEquals:
+                    kms:ViaService:
+                      Fn::Sub: sns.${AWS::Region}.${AWS::URLSuffix}
+                  ForAnyValue:StringEquals:
+                    kms:ResourceAliases: alias/aws/sns
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource:
+                  - Fn::GetAtt:
+                      - OutboxTable
+                      - Arn
+                  - Fn::Sub: ${OutboxTable.Arn}/index/PendingByNextAttempt
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - ReconcileOutboxLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  NotifyOrderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  Fn::GetAtt:
+                    - NotificationsQueue
+                    - Arn
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  Fn::GetAtt:
+                    - NotificationReceiptsTable
+                    - Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource:
+                  - Fn::GetAtt:
+                      - NotificationReceiptsTable
+                      - Arn
+                  - Fn::GetAtt:
+                      - OutboxTable
+                      - Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - NotifyOrderLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  HealthFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - HealthLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  CanaryDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ServerlessDeploymentApplication}/*
+      Policies:
+        - PolicyName: AliasTrafficShifting
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateAlias
+                  - lambda:GetAlias
+                  - lambda:GetProvisionedConcurrencyConfig
+                Resource:
+                  - Fn::Sub: ${CreateOrderFunction.Arn}:live
+                  - Fn::Sub: ${GetOrderFunction.Arn}:live
+                  - Fn::Sub: ${HealthFunction.Arn}:live
+              - Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*
 Outputs:
   OrdersApi:
-    Description: IAM-authorized API endpoint for POST orders and GET orders/{orderId}
-    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/orders
+    Description: Cognito-authorized POST /orders endpoint
+    Value:
+      Fn::Sub: https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/orders
   OrdersTableName:
     Description: DynamoDB Orders table
-    Value: !Ref OrdersTable
+    Value:
+      Ref: OrdersTable
   CreateOrderFunctionArn:
     Description: Create Order Lambda ARN
-    Value: !GetAtt CreateOrderFunction.Arn
+    Value:
+      Fn::GetAtt:
+        - CreateOrderFunction
+        - Arn
   OrdersQueueUrl:
     Description: SQS Orders Queue URL
-    Value: !Ref OrdersQueue
+    Value:
+      Ref: OrdersQueue
   OrdersQueueArn:
     Description: SQS Orders Queue ARN
-    Value: !GetAtt OrdersQueue.Arn
+    Value:
+      Fn::GetAtt:
+        - OrdersQueue
+        - Arn
   OrdersDeadLetterQueueUrl:
     Description: Failed processing messages (safe to redrive after fixing the cause)
-    Value: !Ref OrdersDeadLetterQueue
+    Value:
+      Ref: OrdersDeadLetterQueue
   OrdersDeadLetterQueueArn:
     Description: Failed processing queue ARN for redrive
-    Value: !GetAtt OrdersDeadLetterQueue.Arn
+    Value:
+      Fn::GetAtt:
+        - OrdersDeadLetterQueue
+        - Arn
   PublishFailuresQueueUrl:
     Description: Stream failure metadata (not directly replayable order messages)
-    Value: !Ref PublishFailuresQueue
-  ApiInvokeArn:
-    Description: Resource ARN for callers with execute-api:Invoke permission
-    Value: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ServerlessRestApi}/Prod/*/orders*
+    Value:
+      Ref: PublishFailuresQueue
+  OutboxTable:
+    Description: OutboxTable
+    Value:
+      Ref: OutboxTable
+  IdempotencyTable:
+    Description: IdempotencyTable
+    Value:
+      Ref: IdempotencyTable
+  FulfillmentsTable:
+    Description: FulfillmentsTable
+    Value:
+      Ref: FulfillmentsTable
+  OrdersEventBus:
+    Description: OrdersEventBus
+    Value:
+      Ref: OrdersEventBus
+  NotificationsTopic:
+    Description: NotificationsTopic
+    Value:
+      Ref: NotificationsTopic
+  NotificationsQueueUrl:
+    Description: NotificationsQueue
+    Value:
+      Ref: NotificationsQueue
+  NotificationDeadLetterQueueUrl:
+    Description: NotificationDeadLetterQueue
+    Value:
+      Ref: NotificationDeadLetterQueue
+  EventDeliveryDeadLetterQueueUrl:
+    Description: EventDeliveryDeadLetterQueue
+    Value:
+      Ref: EventDeliveryDeadLetterQueue
+  NotificationAuditQueueUrl:
+    Description: NotificationAuditQueue
+    Value:
+      Ref: NotificationAuditQueue
+  NotificationDeliveryDeadLetterQueueUrl:
+    Description: NotificationDeliveryDeadLetterQueue
+    Value:
+      Ref: NotificationDeliveryDeadLetterQueue
+  ApiBaseUrl:
+    Description: API base URL
+    Value:
+      Fn::Sub: https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod
+  CognitoUserPoolId:
+    Description: Managed Cognito user pool
+    Value:
+      Ref: OrdersUserPool
+  CognitoClientId:
+    Description: Public OAuth client (no secret)
+    Value:
+      Ref: OrdersUserPoolClient
+  CognitoDomain:
+    Description: OAuth authorization and token base URL
+    Value:
+      Fn::Sub: https://${OrdersUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+  OAuthCallbackUrl:
+    Description: Configured callback URL
+    Value:
+      Ref: OAuthCallbackUrl
+  DashboardUrl:
+    Description: CloudWatch operations dashboard
+    Value:
+      Fn::Sub: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-operations
+  CreateOrderFunctionLiveAlias:
+    Description: API traffic uses this versioned live alias
+    Value:
+      Ref: CreateOrderFunctionAliaslive
+  CreateOrderFunctionDeploymentGroup:
+    Description: CodeDeploy group for traffic shifting and rollback inspection
+    Value:
+      Ref: CreateOrderFunctionDeploymentGroup
+  GetOrderFunctionLiveAlias:
+    Description: API traffic uses this versioned live alias
+    Value:
+      Ref: GetOrderFunctionAliaslive
+  GetOrderFunctionDeploymentGroup:
+    Description: CodeDeploy group for traffic shifting and rollback inspection
+    Value:
+      Ref: GetOrderFunctionDeploymentGroup
+  HealthFunctionLiveAlias:
+    Description: API traffic uses this versioned live alias
+    Value:
+      Ref: HealthFunctionAliaslive
+  HealthFunctionDeploymentGroup:
+    Description: CodeDeploy group for traffic shifting and rollback inspection
+    Value:
+      Ref: HealthFunctionDeploymentGroup
+  CodeDeployApplication:
+    Description: CodeDeploy application
+    Value:
+      Ref: ServerlessDeploymentApplication
+Parameters:
+  TestNotificationEmail:
+    Type: String
+    Default: ''
+    Description: Optional, explicitly approved test subscription. Leave empty to send no email.
+  OAuthCallbackUrl:
+    Type: String
+    Default: http://localhost:8765/callback
+    AllowedPattern: ^(https://[^ ]+|http://localhost:[0-9]+/callback)$
+    Description: Explicit OAuth callback; localhost HTTP is for the local PKCE demo only.
+  EnvironmentName:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - production
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional explicitly approved operational alert recipient; enables an encrypted SNS topic and a
+      KMS key.
+Conditions:
+  HasTestEmail:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: TestNotificationEmail
+          - ''
+  HasAlarmEmail:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: AlarmEmail
+          - ''

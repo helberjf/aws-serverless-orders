@@ -210,3 +210,8 @@ $RECYCLE.BIN/
 __pycache__/
 *.py[cod]
 .venv/
+
+# Local authentication and deployment evidence (never commit tokens)
+.tokens/
+.deploy/
+*.token.json

@@ -1,19 +1,17 @@
-import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { GetCommand } from '@aws-sdk/lib-dynamodb';
 import { documentClient, requiredEnv } from '../shared/clients';
-import { jsonResponse, logError } from '../shared/http';
-import { isOrderId } from '../shared/order';
+import { apiHandler, HttpError, jsonResponse } from '../shared/http';
+import { requireOwner } from '../shared/auth';
+import { isOrderId, orderSchema, publicOrder } from '../shared/order';
 
-export const lambdaHandler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+export const lambdaHandler = apiHandler('get_order', async (event) => {
+    const ownerId = requireOwner(event, 'orders/read');
     const orderId = event.pathParameters?.orderId;
-    if (!isOrderId(orderId)) return jsonResponse(400, { message: 'orderId must be a UUID v4' });
-    try {
-        const { Item } = await documentClient.send(
-            new GetCommand({ TableName: requiredEnv('ORDERS_TABLE'), Key: { orderId }, ConsistentRead: true }),
-        );
-        return Item ? jsonResponse(200, Item) : jsonResponse(404, { message: 'Order not found' });
-    } catch (error) {
-        logError('get_order_failed', error, { orderId, requestId: event.requestContext?.requestId });
-        return jsonResponse(500, { message: 'Internal server error' });
-    }
-};
+    if (!isOrderId(orderId)) throw new HttpError(400, 'INVALID_ORDER_ID', 'orderId must be a UUID v4');
+    const { Item } = await documentClient.send(
+        new GetCommand({ TableName: requiredEnv('ORDERS_TABLE'), Key: { orderId }, ConsistentRead: true }),
+    );
+    // Identical response for nonexistent and inaccessible orders prevents cross-user enumeration.
+    if (!Item || Item.ownerId !== ownerId) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
+    return jsonResponse(200, publicOrder(orderSchema.parse(Item)));
+});

@@ -1,6 +1,6 @@
 {
   "name": "aws-serverless-orders",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Event-driven order processing with AWS SAM, Lambda, DynamoDB Streams and SQS",
   "repository": "https://github.com/helberjf/aws-serverless-orders",
@@ -14,28 +14,43 @@
     "lint:check": "npm run lint",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "jest --runInBand",
+    "test": "npm run test:unit",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm test",
     "build": "sam build",
-    "validate": "sam validate --lint"
+    "validate": "sam validate --lint",
+    "test:unit": "vitest run --coverage",
+    "test:integration": "vitest run --config vitest.integration.config.mts",
+    "test:infra": "python -m unittest discover -s tests/infra -v",
+    "test:tooling": "python -m unittest discover -s tests/tooling -v"
   },
   "dependencies": {
+    "@aws-lambda-powertools/logger": "^2.36.0",
+    "@aws-lambda-powertools/metrics": "^2.36.0",
+    "@aws-lambda-powertools/tracer": "^2.36.0",
     "@aws-sdk/client-dynamodb": "^3.1161.0",
+    "@aws-sdk/client-eventbridge": "^3.1161.0",
+    "@aws-sdk/client-sns": "^3.1161.0",
     "@aws-sdk/client-sqs": "^3.1161.0",
-    "@aws-sdk/lib-dynamodb": "^3.1161.0"
+    "@aws-sdk/lib-dynamodb": "^3.1161.0",
+    "zod": "^4.6.7"
+  },
+  "overrides": {
+    "minimatch": "11.0.4"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
   },
   "devDependencies": {
     "@eslint/js": "^10.0.0",
     "@types/aws-lambda": "^8.10.164",
-    "@types/jest": "^30.0.0",
     "@types/node": "^24.0.0",
+    "@vitest/coverage-v8": "^5.1.0",
+    "esbuild": "^0.28.2",
     "eslint": "^10.14.0",
     "eslint-config-prettier": "^10.1.8",
-    "esbuild": "^0.28.2",
-    "jest": "^30.5.2",
     "prettier": "^3.6.2",
-    "ts-jest": "^29.4.15",
     "typescript": "~5.9.3",
-    "typescript-eslint": "^8.72.1"
+    "typescript-eslint": "^8.72.1",
+    "vitest": "^5.1.0"
   }
 }
