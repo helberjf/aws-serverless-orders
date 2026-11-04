@@ -115,27 +115,6 @@ Resources:
             Ref: OrdersUserPoolClient
           COGNITO_ISSUER:
             Fn::Sub: https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${OrdersUserPool}
-      Policies:
-        - Statement:
-            - Effect: Allow
-              Action: dynamodb:GetItem
-              Resource:
-                Fn::GetAtt:
-                  - IdempotencyTable
-                  - Arn
-        - Statement:
-            - Effect: Allow
-              Action: dynamodb:PutItem
-              Resource:
-                - Fn::GetAtt:
-                    - OrdersTable
-                    - Arn
-                - Fn::GetAtt:
-                    - IdempotencyTable
-                    - Arn
-                - Fn::GetAtt:
-                    - OutboxTable
-                    - Arn
       Events:
         CreateOrderApi:
           Type: Api
@@ -146,6 +125,22 @@ Resources:
               Authorizer: OrdersCognitoAuth
               AuthorizationScopes:
                 - orders/write
+      Role:
+        Fn::GetAtt:
+          - CreateOrderFunctionRole
+          - Arn
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      DeploymentPreference:
+        Type: Canary10Percent10Minutes
+        Role:
+          Fn::GetAtt:
+            - CanaryDeploymentRole
+            - Arn
+        Alarms:
+          - Ref: CreateOrderFunctionErrorsAlarm
+          - Ref: CreateOrderFunctionThrottlesAlarm
+          - Ref: ApiServerErrorsAlarm
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -170,14 +165,6 @@ Resources:
             Ref: OrdersUserPoolClient
           COGNITO_ISSUER:
             Fn::Sub: https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${OrdersUserPool}
-      Policies:
-        - Statement:
-            - Effect: Allow
-              Action: dynamodb:GetItem
-              Resource:
-                Fn::GetAtt:
-                  - OrdersTable
-                  - Arn
       Events:
         GetOrderApi:
           Type: Api
@@ -188,6 +175,22 @@ Resources:
               Authorizer: OrdersCognitoAuth
               AuthorizationScopes:
                 - orders/read
+      Role:
+        Fn::GetAtt:
+          - GetOrderFunctionRole
+          - Arn
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      DeploymentPreference:
+        Type: Canary10Percent10Minutes
+        Role:
+          Fn::GetAtt:
+            - CanaryDeploymentRole
+            - Arn
+        Alarms:
+          - Ref: GetOrderFunctionErrorsAlarm
+          - Ref: GetOrderFunctionThrottlesAlarm
+          - Ref: ApiServerErrorsAlarm
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -215,62 +218,6 @@ Resources:
             Ref: OrdersEventBus
           NOTIFICATIONS_TOPIC_ARN:
             Ref: NotificationsTopic
-      Policies:
-        - SQSSendMessagePolicy:
-            QueueName:
-              Fn::GetAtt:
-                - OrdersQueue
-                - QueueName
-        - SQSSendMessagePolicy:
-            QueueName:
-              Fn::GetAtt:
-                - PublishFailuresQueue
-                - QueueName
-        - Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:GetItem
-                - dynamodb:UpdateItem
-              Resource:
-                Fn::GetAtt:
-                  - OutboxTable
-                  - Arn
-        - Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:DescribeStream
-                - dynamodb:GetRecords
-                - dynamodb:GetShardIterator
-                - dynamodb:ListStreams
-              Resource:
-                Fn::GetAtt:
-                  - OutboxTable
-                  - StreamArn
-        - Statement:
-            - Effect: Allow
-              Action: events:PutEvents
-              Resource:
-                Fn::GetAtt:
-                  - OrdersEventBus
-                  - Arn
-        - Statement:
-            - Effect: Allow
-              Action: sns:Publish
-              Resource:
-                Ref: NotificationsTopic
-        - Statement:
-            - Effect: Allow
-              Action:
-                - kms:GenerateDataKey
-                - kms:Decrypt
-              Resource:
-                Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
-              Condition:
-                StringEquals:
-                  kms:ViaService:
-                    Fn::Sub: sns.${AWS::Region}.${AWS::URLSuffix}
-                ForAnyValue:StringEquals:
-                  kms:ResourceAliases: alias/aws/sns
       Events:
         OrderInserted:
           Type: DynamoDB
@@ -296,6 +243,10 @@ Resources:
                   Fn::GetAtt:
                     - PublishFailuresQueue
                     - Arn
+      Role:
+        Fn::GetAtt:
+          - PublishOrderFunctionRole
+          - Arn
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -325,31 +276,6 @@ Resources:
             Ref: OutboxTable
           FULFILLMENTS_TABLE:
             Ref: FulfillmentsTable
-      Policies:
-        - SQSPollerPolicy:
-            QueueName:
-              Fn::GetAtt:
-                - OrdersQueue
-                - QueueName
-        - Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:GetItem
-                - dynamodb:UpdateItem
-              Resource:
-                Fn::GetAtt:
-                  - OrdersTable
-                  - Arn
-        - Statement:
-            - Effect: Allow
-              Action: dynamodb:PutItem
-              Resource:
-                - Fn::GetAtt:
-                    - FulfillmentsTable
-                    - Arn
-                - Fn::GetAtt:
-                    - OutboxTable
-                    - Arn
       Events:
         Orders:
           Type: SQS
@@ -364,6 +290,10 @@ Resources:
             ScalingConfig:
               MaximumConcurrency: 5
             MaximumBatchingWindowInSeconds: 1
+      Role:
+        Fn::GetAtt:
+          - ProcessOrderFunctionRole
+          - Arn
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -568,62 +498,16 @@ Resources:
             Ref: OrdersEventBus
           NOTIFICATIONS_TOPIC_ARN:
             Ref: NotificationsTopic
-      Policies:
-        - SQSSendMessagePolicy:
-            QueueName:
-              Fn::GetAtt:
-                - OrdersQueue
-                - QueueName
-        - SQSSendMessagePolicy:
-            QueueName:
-              Fn::GetAtt:
-                - PublishFailuresQueue
-                - QueueName
-        - Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:GetItem
-                - dynamodb:UpdateItem
-              Resource:
-                Fn::GetAtt:
-                  - OutboxTable
-                  - Arn
-        - Statement:
-            - Effect: Allow
-              Action: events:PutEvents
-              Resource:
-                Fn::GetAtt:
-                  - OrdersEventBus
-                  - Arn
-        - Statement:
-            - Effect: Allow
-              Action: sns:Publish
-              Resource:
-                Ref: NotificationsTopic
-        - Statement:
-            - Effect: Allow
-              Action:
-                - kms:GenerateDataKey
-                - kms:Decrypt
-              Resource:
-                Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
-              Condition:
-                StringEquals:
-                  kms:ViaService:
-                    Fn::Sub: sns.${AWS::Region}.${AWS::URLSuffix}
-                ForAnyValue:StringEquals:
-                  kms:ResourceAliases: alias/aws/sns
-        - Statement:
-            - Effect: Allow
-              Action: dynamodb:Query
-              Resource:
-                Fn::Sub: ${OutboxTable.Arn}/index/PendingByNextAttempt
       Events:
         ReconcileSchedule:
           Type: Schedule
           Properties:
             Schedule: rate(5 minutes)
             Enabled: true
+      Role:
+        Fn::GetAtt:
+          - ReconcileOutboxFunctionRole
+          - Arn
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -838,29 +722,6 @@ Resources:
             Ref: OutboxTable
           NOTIFICATION_RECEIPTS_TABLE:
             Ref: NotificationReceiptsTable
-      Policies:
-        - SQSPollerPolicy:
-            QueueName:
-              Fn::GetAtt:
-                - NotificationsQueue
-                - QueueName
-        - Statement:
-            - Effect: Allow
-              Action: dynamodb:GetItem
-              Resource:
-                Fn::GetAtt:
-                  - NotificationReceiptsTable
-                  - Arn
-        - Statement:
-            - Effect: Allow
-              Action: dynamodb:PutItem
-              Resource:
-                - Fn::GetAtt:
-                    - NotificationReceiptsTable
-                    - Arn
-                - Fn::GetAtt:
-                    - OutboxTable
-                    - Arn
       Events:
         Notifications:
           Type: SQS
@@ -875,6 +736,10 @@ Resources:
               - ReportBatchItemFailures
             ScalingConfig:
               MaximumConcurrency: 5
+      Role:
+        Fn::GetAtt:
+          - NotifyOrderFunctionRole
+          - Arn
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -905,6 +770,22 @@ Resources:
             Method: get
             Auth:
               Authorizer: NONE
+      Role:
+        Fn::GetAtt:
+          - HealthFunctionRole
+          - Arn
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      DeploymentPreference:
+        Type: Canary10Percent10Minutes
+        Role:
+          Fn::GetAtt:
+            - CanaryDeploymentRole
+            - Arn
+        Alarms:
+          - Ref: HealthFunctionErrorsAlarm
+          - Ref: HealthFunctionThrottlesAlarm
+          - Ref: ApiServerErrorsAlarm
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -1687,6 +1568,413 @@ Resources:
           and notification queue backlog","region":"${AWS::Region}","view":"timeSeries","stat":"Maximum","period":60,"metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${OrdersQueue.QueueName}"],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${NotificationsQueue.QueueName}"],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${OrdersDeadLetterQueue.QueueName}"],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${NotificationDeadLetterQueue.QueueName}"]]}},{"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"API
           requests and 5xx","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWS/ApiGateway","Count","ApiName","${AWS::StackName}-api","Stage","Prod"],["AWS/ApiGateway","5XXError","ApiName","${AWS::StackName}-api","Stage","Prod"]]}},{"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Application
           failures and request volume","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWSOrders","OperationFailures","service","${AWS::StackName}"],["AWSOrders","HttpRequests","service","${AWS::StackName}"],["AWSOrders","HttpServerErrors","service","${AWS::StackName}"]]}}]}'
+  CreateOrderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  Fn::GetAtt:
+                    - IdempotencyTable
+                    - Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource:
+                  - Fn::GetAtt:
+                      - OrdersTable
+                      - Arn
+                  - Fn::GetAtt:
+                      - IdempotencyTable
+                      - Arn
+                  - Fn::GetAtt:
+                      - OutboxTable
+                      - Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - CreateOrderLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  GetOrderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersTable
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - GetOrderLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  PublishOrderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersQueue
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  Fn::GetAtt:
+                    - PublishFailuresQueue
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  Fn::GetAtt:
+                    - OutboxTable
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  Fn::GetAtt:
+                    - OutboxTable
+                    - StreamArn
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersEventBus
+                    - Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource:
+                  Ref: NotificationsTopic
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
+                Condition:
+                  StringEquals:
+                    kms:ViaService:
+                      Fn::Sub: sns.${AWS::Region}.${AWS::URLSuffix}
+                  ForAnyValue:StringEquals:
+                    kms:ResourceAliases: alias/aws/sns
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - PublishOrderLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  ProcessOrderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersQueue
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersTable
+                    - Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource:
+                  - Fn::GetAtt:
+                      - FulfillmentsTable
+                      - Arn
+                  - Fn::GetAtt:
+                      - OutboxTable
+                      - Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - ProcessOrderLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  ReconcileOutboxFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersQueue
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  Fn::GetAtt:
+                    - OutboxTable
+                    - Arn
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource:
+                  Fn::GetAtt:
+                    - OrdersEventBus
+                    - Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource:
+                  Ref: NotificationsTopic
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
+                Condition:
+                  StringEquals:
+                    kms:ViaService:
+                      Fn::Sub: sns.${AWS::Region}.${AWS::URLSuffix}
+                  ForAnyValue:StringEquals:
+                    kms:ResourceAliases: alias/aws/sns
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource:
+                  Fn::Sub: ${OutboxTable.Arn}/index/PendingByNextAttempt
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - ReconcileOutboxLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  NotifyOrderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  Fn::GetAtt:
+                    - NotificationsQueue
+                    - Arn
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  Fn::GetAtt:
+                    - NotificationReceiptsTable
+                    - Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource:
+                  - Fn::GetAtt:
+                      - NotificationReceiptsTable
+                      - Arn
+                  - Fn::GetAtt:
+                      - OutboxTable
+                      - Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - NotifyOrderLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  HealthFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - HealthLogGroup
+                    - Arn
+              - Sid: XRayWriteRequiresWildcard
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+  CanaryDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ServerlessDeploymentApplication}/*
+      Policies:
+        - PolicyName: AliasTrafficShifting
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateAlias
+                  - lambda:GetAlias
+                  - lambda:GetProvisionedConcurrencyConfig
+                Resource:
+                  - Fn::Sub: ${CreateOrderFunction.Arn}:live
+                  - Fn::Sub: ${GetOrderFunction.Arn}:live
+                  - Fn::Sub: ${HealthFunction.Arn}:live
+              - Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*
 Outputs:
   OrdersApi:
     Description: Cognito-authorized POST /orders endpoint
@@ -1790,6 +2078,34 @@ Outputs:
     Description: CloudWatch operations dashboard
     Value:
       Fn::Sub: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-operations
+  CreateOrderFunctionLiveAlias:
+    Description: API traffic uses this versioned live alias
+    Value:
+      Ref: CreateOrderFunctionAliaslive
+  CreateOrderFunctionDeploymentGroup:
+    Description: CodeDeploy group for traffic shifting and rollback inspection
+    Value:
+      Ref: CreateOrderFunctionDeploymentGroup
+  GetOrderFunctionLiveAlias:
+    Description: API traffic uses this versioned live alias
+    Value:
+      Ref: GetOrderFunctionAliaslive
+  GetOrderFunctionDeploymentGroup:
+    Description: CodeDeploy group for traffic shifting and rollback inspection
+    Value:
+      Ref: GetOrderFunctionDeploymentGroup
+  HealthFunctionLiveAlias:
+    Description: API traffic uses this versioned live alias
+    Value:
+      Ref: HealthFunctionAliaslive
+  HealthFunctionDeploymentGroup:
+    Description: CodeDeploy group for traffic shifting and rollback inspection
+    Value:
+      Ref: HealthFunctionDeploymentGroup
+  CodeDeployApplication:
+    Description: CodeDeploy application
+    Value:
+      Ref: ServerlessDeploymentApplication
 Parameters:
   TestNotificationEmail:
     Type: String
