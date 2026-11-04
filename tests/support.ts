@@ -33,7 +33,19 @@ export function apiEvent(body: string | null = JSON.stringify(input)): APIGatewa
         isBase64Encoded: false,
         headers: { 'Idempotency-Key': 'request-1' },
         pathParameters: { orderId },
-        requestContext: { requestId: 'test-request', authorizer: { claims: { sub: 'user-a' } } },
+        requestContext: {
+            requestId: 'test-request',
+            authorizer: {
+                claims: {
+                    sub: 'user-a',
+                    token_use: 'access',
+                    client_id: 'test-client',
+                    iss: 'https://cognito-idp.sa-east-1.amazonaws.com/sa-east-1_test',
+                    exp: String(Math.floor(Date.now() / 1000) + 3600),
+                    scope: 'orders/read orders/write',
+                },
+            },
+        },
     } as unknown as APIGatewayProxyEvent;
 }
 export function sqsEvent(...bodies: string[]): SQSEvent {

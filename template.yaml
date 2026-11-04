@@ -14,7 +14,32 @@ Globals:
   Api:
     TracingEnabled: true
     Auth:
-      DefaultAuthorizer: AWS_IAM
+      DefaultAuthorizer: OrdersCognitoAuth
+      Authorizers:
+        OrdersCognitoAuth:
+          UserPoolArn:
+            Fn::GetAtt:
+              - OrdersUserPool
+              - Arn
+    MethodSettings:
+      - ResourcePath: /*
+        HttpMethod: '*'
+        MetricsEnabled: true
+        DataTraceEnabled: false
+        ThrottlingRateLimit: 10
+        ThrottlingBurstLimit: 20
+    GatewayResponses:
+      UNAUTHORIZED:
+        StatusCode: 401
+        ResponseTemplates:
+          application/json: '{"code":"UNAUTHORIZED","message":"Authentication is required","requestId":"$context.requestId"}'
+      ACCESS_DENIED:
+        StatusCode: 403
+        ResponseTemplates:
+          application/json: '{"code":"FORBIDDEN","message":"Access denied","requestId":"$context.requestId"}'
+      DEFAULT_5XX:
+        ResponseTemplates:
+          application/json: '{"code":"INTERNAL_ERROR","message":"Internal server error","requestId":"$context.requestId"}'
 Resources:
   OrdersTable:
     Type: AWS::DynamoDB::Table
@@ -70,12 +95,21 @@ Resources:
             Ref: OutboxTable
           IDEMPOTENCY_TABLE:
             Ref: IdempotencyTable
+          COGNITO_CLIENT_ID:
+            Ref: OrdersUserPoolClient
+          COGNITO_ISSUER:
+            Fn::Sub: https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${OrdersUserPool}
       Policies:
         - Statement:
             - Effect: Allow
-              Action:
-                - dynamodb:PutItem
-                - dynamodb:GetItem
+              Action: dynamodb:GetItem
+              Resource:
+                Fn::GetAtt:
+                  - IdempotencyTable
+                  - Arn
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
               Resource:
                 - Fn::GetAtt:
                     - OrdersTable
@@ -92,6 +126,10 @@ Resources:
           Properties:
             Path: /orders
             Method: post
+            Auth:
+              Authorizer: OrdersCognitoAuth
+              AuthorizationScopes:
+                - orders/write
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -112,6 +150,10 @@ Resources:
         Variables:
           ORDERS_TABLE:
             Ref: OrdersTable
+          COGNITO_CLIENT_ID:
+            Ref: OrdersUserPoolClient
+          COGNITO_ISSUER:
+            Fn::Sub: https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${OrdersUserPool}
       Policies:
         - Statement:
             - Effect: Allow
@@ -126,6 +168,10 @@ Resources:
           Properties:
             Path: /orders/{orderId}
             Method: get
+            Auth:
+              Authorizer: OrdersCognitoAuth
+              AuthorizationScopes:
+                - orders/read
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -272,13 +318,16 @@ Resources:
         - Statement:
             - Effect: Allow
               Action:
-                - dynamodb:UpdateItem
                 - dynamodb:GetItem
-                - dynamodb:PutItem
+                - dynamodb:UpdateItem
               Resource:
-                - Fn::GetAtt:
-                    - OrdersTable
-                    - Arn
+                Fn::GetAtt:
+                  - OrdersTable
+                  - Arn
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource:
                 - Fn::GetAtt:
                     - FulfillmentsTable
                     - Arn
@@ -644,6 +693,19 @@ Resources:
               StringEquals:
                 aws:SourceAccount:
                   Ref: AWS::AccountId
+          - Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource:
+              - Fn::GetAtt:
+                  - NotificationsQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - EventDeliveryDeadLetterQueue
+                  - Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
   NotificationAuditQueuePolicy:
     Type: AWS::SQS::QueuePolicy
     Properties:
@@ -671,6 +733,19 @@ Resources:
               StringEquals:
                 aws:SourceAccount:
                   Ref: AWS::AccountId
+          - Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource:
+              - Fn::GetAtt:
+                  - NotificationAuditQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - NotificationDeliveryDeadLetterQueue
+                  - Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
   NotificationAuditSubscription:
     Type: AWS::SNS::Subscription
     DependsOn: NotificationAuditQueuePolicy
@@ -734,9 +809,14 @@ Resources:
                 - QueueName
         - Statement:
             - Effect: Allow
-              Action:
-                - dynamodb:GetItem
-                - dynamodb:PutItem
+              Action: dynamodb:GetItem
+              Resource:
+                Fn::GetAtt:
+                  - NotificationReceiptsTable
+                  - Arn
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
               Resource:
                 - Fn::GetAtt:
                     - NotificationReceiptsTable
@@ -802,9 +882,147 @@ Resources:
       LogGroupName:
         Fn::Sub: /aws/lambda/${AWS::StackName}/health
       RetentionInDays: 14
+  OrdersUserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName:
+        Fn::Sub: ${AWS::StackName}-users
+      UserPoolTier: LITE
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 1
+      MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: admin_only
+            Priority: 1
+      UserPoolTags:
+        Project:
+          Ref: AWS::StackName
+  OrdersResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId:
+        Ref: OrdersUserPool
+      Identifier: orders
+      Name: Orders API
+      Scopes:
+        - ScopeName: read
+          ScopeDescription: Read own orders
+        - ScopeName: write
+          ScopeDescription: Create own orders
+  OrdersUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: OrdersResourceServer
+    Properties:
+      UserPoolId:
+        Ref: OrdersUserPool
+      ClientName:
+        Fn::Sub: ${AWS::StackName}-public-client
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - orders/read
+        - orders/write
+      CallbackURLs:
+        - Ref: OAuthCallbackUrl
+      LogoutURLs:
+        - Ref: OAuthCallbackUrl
+      SupportedIdentityProviders:
+        - COGNITO
+      AccessTokenValidity: 15
+      IdTokenValidity: 15
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+  OrdersUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId:
+        Ref: OrdersUserPool
+      Domain:
+        Fn::Sub:
+          - orders-${AWS::AccountId}-${Suffix}
+          - Suffix:
+              Fn::Select:
+                - 0
+                - Fn::Split:
+                    - '-'
+                    - Fn::Select:
+                        - 2
+                        - Fn::Split:
+                            - /
+                            - Ref: AWS::StackId
+  QueueTlsPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - Ref: OrdersDeadLetterQueue
+        - Ref: PublishFailuresQueue
+        - Ref: OrdersQueue
+        - Ref: NotificationDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource:
+              - Fn::GetAtt:
+                  - OrdersDeadLetterQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - PublishFailuresQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - OrdersQueue
+                  - Arn
+              - Fn::GetAtt:
+                  - NotificationDeadLetterQueue
+                  - Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  NotificationTopicTlsPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - Ref: NotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: sns:Publish
+            Resource:
+              Ref: NotificationsTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 Outputs:
   OrdersApi:
-    Description: IAM-authorized API endpoint for POST orders and GET orders/{orderId}
+    Description: Cognito-authorized POST /orders endpoint
     Value:
       Fn::Sub: https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/orders
   OrdersTableName:
@@ -841,10 +1059,6 @@ Outputs:
     Description: Stream failure metadata (not directly replayable order messages)
     Value:
       Ref: PublishFailuresQueue
-  ApiInvokeArn:
-    Description: Resource ARN for callers with execute-api:Invoke permission
-    Value:
-      Fn::Sub: arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ServerlessRestApi}/Prod/*/orders*
   OutboxTable:
     Description: OutboxTable
     Value:
@@ -889,11 +1103,32 @@ Outputs:
     Description: API base URL
     Value:
       Fn::Sub: https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod
+  CognitoUserPoolId:
+    Description: Managed Cognito user pool
+    Value:
+      Ref: OrdersUserPool
+  CognitoClientId:
+    Description: Public OAuth client (no secret)
+    Value:
+      Ref: OrdersUserPoolClient
+  CognitoDomain:
+    Description: OAuth authorization and token base URL
+    Value:
+      Fn::Sub: https://${OrdersUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+  OAuthCallbackUrl:
+    Description: Configured callback URL
+    Value:
+      Ref: OAuthCallbackUrl
 Parameters:
   TestNotificationEmail:
     Type: String
     Default: ''
     Description: Optional, explicitly approved test subscription. Leave empty to send no email.
+  OAuthCallbackUrl:
+    Type: String
+    Default: http://localhost:8765/callback
+    AllowedPattern: ^(https://[^ ]+|http://localhost:[0-9]+/callback)$
+    Description: Explicit OAuth callback; localhost HTTP is for the local PKCE demo only.
 Conditions:
   HasTestEmail:
     Fn::Not:

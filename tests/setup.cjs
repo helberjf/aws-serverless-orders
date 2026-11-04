@@ -10,3 +10,6 @@ process.env.NOTIFICATION_RECEIPTS_TABLE = 'test-notification-receipts';
 process.env.ORDERS_QUEUE_URL = 'https://sqs.sa-east-1.amazonaws.com/123456789012/test-orders';
 process.env.ORDERS_EVENT_BUS = 'test-orders';
 process.env.NOTIFICATIONS_TOPIC_ARN = 'arn:aws:sns:sa-east-1:123456789012:test-orders';
+
+process.env.COGNITO_CLIENT_ID = 'test-client';
+process.env.COGNITO_ISSUER = 'https://cognito-idp.sa-east-1.amazonaws.com/sa-east-1_test';

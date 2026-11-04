@@ -8,7 +8,7 @@ import { orderInputSchema, publicOrder, type Order } from '../shared/order';
 import { outboxItem } from '../shared/outbox';
 
 export const lambdaHandler = apiHandler('create_order', async (event) => {
-    const ownerId = requireOwner(event);
+    const ownerId = requireOwner(event, 'orders/write');
     const parsed = orderInputSchema.safeParse(parseBody(event));
     if (!parsed.success)
         throw new HttpError(

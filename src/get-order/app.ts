@@ -5,7 +5,7 @@ import { requireOwner } from '../shared/auth';
 import { isOrderId, orderSchema, publicOrder } from '../shared/order';
 
 export const lambdaHandler = apiHandler('get_order', async (event) => {
-    const ownerId = requireOwner(event);
+    const ownerId = requireOwner(event, 'orders/read');
     const orderId = event.pathParameters?.orderId;
     if (!isOrderId(orderId)) throw new HttpError(400, 'INVALID_ORDER_ID', 'orderId must be a UUID v4');
     const { Item } = await documentClient.send(
